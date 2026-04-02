@@ -479,6 +479,9 @@ void S2p::ProcessScsiCommands()
     ready = true;
 
     while (service_thread.IsRunning()) {
+        // Process queued MIDI initiator commands while bus is free
+        dispatcher->ProcessMidiQueue();
+
         if (const uint8_t ids = bus->WaitForSelection(); ids) {
             scoped_lock lock(executor->GetDispatchLock());
 

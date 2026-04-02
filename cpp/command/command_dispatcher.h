@@ -8,8 +8,11 @@
 
 #pragma once
 
+#include <condition_variable>
+#include <mutex>
 #include <string>
 #include <unordered_set>
+#include <vector>
 #include <spdlog/spdlog.h>
 #include "shared/s2p_defs.h"
 #include "generated/s2p_interface.pb.h"
@@ -47,6 +50,35 @@ private:
     bool ShutDown(const CommandContext&) const;
 
     bool ExecuteMidi(const CommandContext&, PbResult&);
+
+public:
+
+    // MIDI command queue for main loop execution
+    struct MidiCommand {
+        PbOperation operation;
+        int target_id;
+        vector<uint8_t> sysex_data;
+        int read_length;
+        // Result — set by main loop
+        bool completed = false;
+        bool success = false;
+        vector<uint8_t> response_data;
+        int pending_bytes = 0;
+        mutex mtx;
+        condition_variable cv;
+    };
+
+    // Queue a MIDI command and wait for the main loop to execute it
+    shared_ptr<MidiCommand> QueueMidiCommand(PbOperation op, int target_id,
+        const vector<uint8_t> &sysex = {}, int read_length = 0);
+
+    // Execute pending MIDI commands (called from main loop when bus is free)
+    void ProcessMidiQueue();
+
+private:
+
+    vector<shared_ptr<MidiCommand>> midi_queue;
+    mutex midi_queue_mutex;
 
     CommandExecutor &executor;
 

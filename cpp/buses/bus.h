@@ -169,6 +169,15 @@ public:
         return phase_names[static_cast<int>(phase)];
     }
 
+    // Switch bus direction between target and initiator mode.
+    // In initiator mode: IND=true, DTD=false
+    // In target mode: IND=false, DTD=true
+    void SetInitiatorMode(bool initiator) const
+    {
+        SetSignal(PIN_IND, initiator);
+        SetSignal(PIN_DTD, !initiator);
+    }
+
 protected:
 
     Bus() = default;

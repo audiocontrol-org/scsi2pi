@@ -224,10 +224,18 @@ void RpiBus::Reset() const
 uint8_t RpiBus::WaitForSelection()
 {
 #ifdef __linux__
-    if (epoll_event epev; epoll_wait(epoll_fd, &epev, 1, -1) == -1) {
+    // Use 100ms timeout instead of infinite wait to allow the main loop
+    // to process queued initiator commands (e.g., MIDI-over-SCSI)
+    epoll_event epev;
+    const int epoll_result = epoll_wait(epoll_fd, &epev, 1, 100);
+    if (epoll_result < 0) {
         if (errno != EINTR) {
             warn("epoll_wait failed: {}", strerror(errno));
         }
+        return 0;
+    }
+    if (epoll_result == 0) {
+        // Timeout — no selection, return to main loop for command processing
         return 0;
     }
 

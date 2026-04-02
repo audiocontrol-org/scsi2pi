@@ -7,7 +7,9 @@
 //---------------------------------------------------------------------------
 
 #include "command_dispatcher.h"
+#include <chrono>
 #include <fstream>
+#include <unistd.h>
 #include "buses/bus.h"
 #include "command_context.h"
 #include "command_executor.h"
@@ -311,107 +313,122 @@ bool CommandDispatcher::ExecuteMidi(const CommandContext &context, PbResult &res
         return context.ReturnErrorStatus("Invalid SCSI target ID: " + to_string(target_id));
     }
 
-    // Acquire the dispatch lock to ensure no target transaction is in progress
-    scoped_lock lock(executor.GetDispatchLock());
+    // Queue the command for main loop execution (the main loop has bus access)
+    vector<uint8_t> sysex;
+    if (operation == MIDI_SEND) {
+        const string &data = midi_request.sysex_data();
+        sysex.assign(data.begin(), data.end());
+    }
 
-    // Create an initiator executor with the bus, using board ID 7
+    auto cmd = QueueMidiCommand(operation, target_id, sysex, midi_request.read_length());
+
+    // Wait for the main loop to execute it (up to 5 seconds)
+    {
+        unique_lock lock(cmd->mtx);
+        if (!cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return cmd->completed; })) {
+            return context.ReturnErrorStatus("MIDI command timed out waiting for bus access");
+        }
+    }
+
+    if (!cmd->success) {
+        return context.ReturnErrorStatus("MIDI command failed");
+    }
+
+    auto *midi_response = result.mutable_midi_response();
+    midi_response->set_data(cmd->response_data.data(), cmd->response_data.size());
+    midi_response->set_pending_bytes(cmd->pending_bytes);
+    return context.WriteSuccessResult(result);
+}
+
+shared_ptr<CommandDispatcher::MidiCommand> CommandDispatcher::QueueMidiCommand(
+    PbOperation op, int target_id, const vector<uint8_t> &sysex, int read_length)
+{
+    auto cmd = make_shared<MidiCommand>();
+    cmd->operation = op;
+    cmd->target_id = target_id;
+    cmd->sysex_data = sysex;
+    cmd->read_length = read_length;
+
+    {
+        lock_guard lock(midi_queue_mutex);
+        midi_queue.push_back(cmd);
+    }
+
+    return cmd;
+}
+
+void CommandDispatcher::ProcessMidiQueue()
+{
+    shared_ptr<MidiCommand> cmd;
+
+    {
+        lock_guard lock(midi_queue_mutex);
+        if (midi_queue.empty()) return;
+        cmd = midi_queue.front();
+        midi_queue.erase(midi_queue.begin());
+    }
+
+    // Switch bus to initiator mode with settling delay
+    bus.SetInitiatorMode(true);
+    usleep(10000);  // 10ms settle time
+
+    // Execute on the main thread where the bus is free
     InitiatorExecutor initiator(bus, 7, s2p_logger);
-    initiator.SetTarget(target_id, 0, false);
+    initiator.SetTarget(cmd->target_id, 0, false);
 
-    switch (operation) {
+    int status = 0;
+    switch (cmd->operation) {
     case MIDI_INIT: {
-        s2p_logger.info("MIDI_INIT: Initializing MIDI-via-SCSI session with target {}", target_id);
-
-        // CDB: 09:00:01:01:00:00
+        s2p_logger.info("MIDI_INIT: target {}", cmd->target_id);
         vector<uint8_t> cdb = { 0x09, 0x00, 0x01, 0x01, 0x00, 0x00 };
         vector<uint8_t> buffer(256);
-        const int status = initiator.Execute(cdb, buffer, 0, 3, false);
-
-        if (status != 0) {
-            return context.ReturnErrorStatus(
-                fmt::format("MIDI_INIT failed with status {:#04x}", status));
-        }
-
-        auto *midi_response = result.mutable_midi_response();
-        midi_response->set_data(buffer.data(), 0);
-        return context.WriteSuccessResult(result);
+        status = initiator.Execute(cdb, buffer, 0, 3, false);
+        break;
     }
-
     case MIDI_SEND: {
-        const string &sysex = midi_request.sysex_data();
-        if (sysex.empty()) {
-            return context.ReturnErrorStatus("MIDI_SEND requires sysex_data");
-        }
-
-        s2p_logger.info("MIDI_SEND: Sending {} byte(s) to target {}", sysex.size(), target_id);
-
-        // CDB: 0C:00:00:00:LL:00 where LL = data length
-        const auto data_len = static_cast<uint8_t>(sysex.size());
-        vector<uint8_t> cdb = { 0x0c, 0x00, 0x00, 0x00, data_len, 0x00 };
-        vector<uint8_t> data(sysex.begin(), sysex.end());
-        const int status = initiator.Execute(cdb, data, static_cast<int>(data.size()), 3, false);
-
-        if (status != 0) {
-            return context.ReturnErrorStatus(
-                fmt::format("MIDI_SEND failed with status {:#04x}", status));
-        }
-
-        auto *midi_response = result.mutable_midi_response();
-        midi_response->set_data("", 0);
-        return context.WriteSuccessResult(result);
+        s2p_logger.info("MIDI_SEND: {} byte(s) to target {}", cmd->sysex_data.size(), cmd->target_id);
+        const auto len = static_cast<uint8_t>(cmd->sysex_data.size());
+        vector<uint8_t> cdb = { 0x0c, 0x00, 0x00, 0x00, len, 0x00 };
+        status = initiator.Execute(cdb, cmd->sysex_data, static_cast<int>(cmd->sysex_data.size()), 3, false);
+        break;
     }
-
     case MIDI_POLL: {
-        s2p_logger.info("MIDI_POLL: Polling target {} for pending bytes", target_id);
-
-        // CDB: 0D:00:00:00:00:00, returns 3 bytes
         vector<uint8_t> cdb = { 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00 };
         vector<uint8_t> buffer(4);
-        const int status = initiator.Execute(cdb, buffer, 3, 3, false);
-
-        if (status != 0) {
-            return context.ReturnErrorStatus(
-                fmt::format("MIDI_POLL failed with status {:#04x}", status));
+        status = initiator.Execute(cdb, buffer, 3, 3, false);
+        if (status == 0) {
+            cmd->pending_bytes = (buffer[1] << 8) | buffer[2];
+            cmd->response_data.assign(buffer.begin(), buffer.begin() + 3);
+            s2p_logger.info("MIDI_POLL: {} pending byte(s)", cmd->pending_bytes);
         }
-
-        // Parse: pending = (buffer[1] << 8) | buffer[2]
-        const int pending = (buffer[1] << 8) | buffer[2];
-        s2p_logger.info("MIDI_POLL: {} pending byte(s)", pending);
-
-        auto *midi_response = result.mutable_midi_response();
-        midi_response->set_pending_bytes(pending);
-        midi_response->set_data(buffer.data(), 3);
-        return context.WriteSuccessResult(result);
+        break;
     }
-
     case MIDI_READ: {
-        const int read_length = midi_request.read_length();
-        if (read_length <= 0 || read_length > 65535) {
-            return context.ReturnErrorStatus("MIDI_READ requires valid read_length (1-65535)");
-        }
-
-        s2p_logger.info("MIDI_READ: Reading {} byte(s) from target {}", read_length, target_id);
-
-        // CDB: 0E:00:00:00:LL:00 where LL = read_length
-        const auto len_byte = static_cast<uint8_t>(read_length);
+        const int rlen = cmd->read_length;
+        s2p_logger.info("MIDI_READ: {} byte(s) from target {}", rlen, cmd->target_id);
+        const auto len_byte = static_cast<uint8_t>(rlen);
         vector<uint8_t> cdb = { 0x0e, 0x00, 0x00, 0x00, len_byte, 0x00 };
-        vector<uint8_t> buffer(read_length);
-        const int status = initiator.Execute(cdb, buffer, read_length, 3, false);
-
-        if (status != 0) {
-            return context.ReturnErrorStatus(
-                fmt::format("MIDI_READ failed with status {:#04x}", status));
+        vector<uint8_t> buffer(rlen);
+        status = initiator.Execute(cdb, buffer, rlen, 3, false);
+        if (status == 0) {
+            const int byte_count = initiator.GetByteCount();
+            cmd->response_data.assign(buffer.begin(), buffer.begin() + byte_count);
+            s2p_logger.info("MIDI_READ: received {} byte(s)", byte_count);
         }
-
-        const int byte_count = initiator.GetByteCount();
-        s2p_logger.info("MIDI_READ: Received {} byte(s)", byte_count);
-
-        auto *midi_response = result.mutable_midi_response();
-        midi_response->set_data(buffer.data(), byte_count);
-        return context.WriteSuccessResult(result);
+        break;
     }
-
     default:
-        return context.ReturnErrorStatus("Unknown MIDI operation");
+        break;
     }
+
+    // Switch bus back to target mode
+    bus.SetInitiatorMode(false);
+
+    // Signal completion
+    {
+        lock_guard lock(cmd->mtx);
+        cmd->success = (status == 0);
+        cmd->completed = true;
+    }
+    cmd->cv.notify_one();
 }
