@@ -121,21 +121,23 @@ void MidiProcessor::RetrieveStats()
 void MidiProcessor::SendData() const
 {
     // The S3000XL sends MIDI SysEx data via 0x0D.
-    // CDB byte 4 may contain the transfer length, or the length may be
-    // encoded differently. Try byte 4 first, fall back to bytes 2-4.
+    // Parse transfer length: try byte 4, then bytes 2-4.
     int length = GetCdbByte(4);
     if (length == 0) {
         length = GetCdbInt24(2);
     }
 
     if (length == 0) {
-        // True zero-length — the S3000XL still expects DATA OUT phase.
-        // Accept a small buffer to see what it sends.
-        length = 65536;
-        LogDebug(fmt::format("MIDI SEND: CDB has zero length, accepting up to {} bytes", length));
+        // Zero-length CDB. The S3000XL doesn't send data for this.
+        // Neither StatusPhase (MESSAGE IN timeout) nor DataOutPhase
+        // (no bytes received) works. Try DataInPhase — maybe the
+        // S3000XL expects a response acknowledging the SEND capability.
+        LogDebug("MIDI SEND: zero-length, trying DATA IN with 0 bytes");
+        DataInPhase(0);
+        return;
     }
 
-    GetController()->SetTransferSize(length, length);
+    LogDebug(fmt::format("MIDI SEND: accepting {} byte(s)", length));
     DataOutPhase(length);
 }
 
@@ -174,8 +176,6 @@ int MidiProcessor::WriteData(cdb_t cdb, data_out_t buf, int length)
         LogDebug(fmt::format("MIDI Processor: accepted {} byte(s) of config data", length));
     }
 
-    GetController()->SetTransferSize(0, 0);
-
     return length;
 }
 
@@ -191,12 +191,11 @@ void MidiProcessor::SetInterfaceMode() const
 {
     // The S3000XL sends config data via 0x0C.
     // CDB byte 4 contains the transfer length.
-    // We MUST enter DATA OUT phase to accept the data — returning
-    // StatusPhase directly causes the S3000XL to timeout on MESSAGE IN.
+    // Must enter DATA OUT to accept the data — the S3000XL expects to
+    // write data and will timeout on MESSAGE IN if we skip to STATUS.
     const int length = GetCdbByte(4);
 
     if (length > 0) {
-        GetController()->SetTransferSize(length, length);
         DataOutPhase(length);
     }
     else {

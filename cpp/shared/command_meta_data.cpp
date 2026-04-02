@@ -43,8 +43,8 @@ CommandMetaData::CommandMetaData()
     AddCommand(ScsiCommand::RETRIEVE_STATS, 6, "RETRIEVE STATS", { 4, 1, 0, 0, false });
     AddCommand(ScsiCommand::WRITE_6, 6, "WRITE(6)/SEND MESSAGE(6)/PRINT", { 4, 1, 1, 3, true });
     AddCommand(ScsiCommand::SEEK_6, 6, "SEEK(6)", { 0, 0, 0, 0, false });
-    AddCommand(ScsiCommand::SET_IFACE_MODE, 6, "SET INTERFACE MODE", { 0, 0, 0, 0, false });
-    AddCommand(ScsiCommand::SET_MCAST_ADDR, 6, "SET MULTICAST ADDRESS", { 0, 0, 0, 0, false });
+    AddCommand(ScsiCommand::SET_IFACE_MODE, 6, "SET INTERFACE MODE", { 0, 0, 0, 0, true });
+    AddCommand(ScsiCommand::SET_MCAST_ADDR, 6, "SET MULTICAST ADDRESS", { 0, 0, 0, 0, true });
     AddCommand(ScsiCommand::ENABLE_INTERFACE, 6, "ENABLE INTERFACE", { 0, 0, 0, 0, false });
     AddCommand(ScsiCommand::READ_REVERSE, 6, "READ REVERSE(6)", { 4, 1, 1, 3, false });
     AddCommand(ScsiCommand::SYNCHRONIZE_BUFFER, 6, "SYNCHRONIZE BUFFER/WRITE_FILEMARKS(6)", { 0, 0, 0, 0, false });
