@@ -32,6 +32,9 @@
 #if defined BUILD_SCHD || defined BUILD_SCRM
 #include "devices/scsi_hd.h"
 #endif
+#ifdef BUILD_SCMP
+#include "devices/midi_processor.h"
+#endif
 #ifdef BUILD_SCSG
 #include "devices/scsi_generic.h"
 #endif
@@ -111,6 +114,11 @@ shared_ptr<PrimaryDevice> DeviceFactory::CreateDevice(PbDeviceType type, int lun
 #ifdef BUILD_SCLP
     case SCLP:
         return make_shared<Printer>(lun);
+#endif
+
+#ifdef BUILD_SCMP
+    case SCMP:
+        return make_shared<MidiProcessor>(lun);
 #endif
 
 #ifdef BUILD_SCSG

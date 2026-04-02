@@ -196,6 +196,7 @@ private:
         { SCCD, DeviceType::CD_DVD },
         { SCDP, DeviceType::PROCESSOR },
         { SCHS, DeviceType::PROCESSOR },
+        { SCMP, DeviceType::PROCESSOR },
         { SCLP, DeviceType::PRINTER },
         { SCTP, DeviceType::SEQUENTIAL_ACCESS }
     };

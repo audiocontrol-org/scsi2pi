@@ -44,6 +44,7 @@ private:
 
     inline static const unordered_map<string_view, PbDeviceType> DEVICE_MAPPING = {
         { "daynaport", SCDP },
+        { "midi", SCMP },
         { "printer", SCLP },
         { "services", SCHS }
     };

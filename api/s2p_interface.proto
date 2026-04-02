@@ -48,6 +48,8 @@ enum PbDeviceType {
     SCTP = 10;
     // Linux SG Driver (e.g. for a SCSI-to-USB bridge)
     SCSG = 11;
+    // MIDI processor device (for MIDI-via-SCSI)
+    SCMP = 12;
 }
 
 // Remote operations, returning PbResult

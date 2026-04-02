@@ -88,8 +88,9 @@ CXXFLAGS += -DBOARD_$(BOARD)
 ##       SCLP SCSI Printer
 ##       SCSG Linux Generic SCSI (e.g. for SCSI-to-USB bridge)
 ##       SCHS Host Services (e.g. for realtime clock and shutdown)
+##       SCMP MIDI Processor (for MIDI-via-SCSI)
 ##       SAHD SASI Hard Drive
-ifeq ($(or $(ENABLE_SCHD),$(ENABLE_SCMO),$(ENABLE_SCCD),$(ENABLE_SCTP),$(ENABLE_SCDP),$(ENABLE_SCLP),$(ENABLE_SCSG),$(ENABLE_SCHS),$(ENABLE_SAHD)),)
+ifeq ($(or $(ENABLE_SCHD),$(ENABLE_SCMO),$(ENABLE_SCCD),$(ENABLE_SCTP),$(ENABLE_SCDP),$(ENABLE_SCLP),$(ENABLE_SCSG),$(ENABLE_SCHS),$(ENABLE_SCMP),$(ENABLE_SAHD)),)
 	ENABLE_SCHD = 1
 	ENABLE_SCMO = 1
 	ENABLE_SCCD = 1
@@ -98,6 +99,7 @@ ifeq ($(or $(ENABLE_SCHD),$(ENABLE_SCMO),$(ENABLE_SCCD),$(ENABLE_SCTP),$(ENABLE_
 	ENABLE_SCLP = 1
 	ENABLE_SCSG = 1
 	ENABLE_SCHS = 1
+	ENABLE_SCMP = 1
 	ENABLE_SAHD = 1
 endif
 
@@ -117,9 +119,9 @@ define add_cxx_flag
 	endif
 endef
 
-$(foreach var, SCHD SCMO SCCD SCTP SCDP SCLP SCSG SCHS SAHD, $(eval $(call disable_type,$(var))))
+$(foreach var, SCHD SCMO SCCD SCTP SCDP SCLP SCSG SCHS SCMP SAHD, $(eval $(call disable_type,$(var))))
 
-$(foreach var, SCHD SCRM SCMO SCCD SCTP SCDP SCLP SCSG SCHS SAHD, $(eval $(call add_cxx_flag,$(var))))
+$(foreach var, SCHD SCRM SCMO SCCD SCTP SCDP SCLP SCSG SCHS SCMP SAHD, $(eval $(call add_cxx_flag,$(var))))
 
 ifeq ($(or $(ENABLE_SCHD),$(ENABLE_SCRM),$(ENABLE_SCMO),$(ENABLE_SCCD),$(ENABLE_SAHD),$(ENABLE_SCTP)),1)
 	CXXFLAGS += -DBUILD_STORAGE_DEVICE
@@ -251,6 +253,11 @@ SRC_SCHS = \
 	$(DIR_DEVICES)/page_handler.cpp
 endif
 
+ifeq ($(ENABLE_SCMP),1)
+SRC_SCMP = \
+	$(DIR_DEVICES)/midi_processor.cpp
+endif
+
 ifeq ($(ENABLE_SAHD),1)
 SRC_SAHD = \
 	$(DIR_DEVICES)/sasi_hd.cpp \
@@ -319,6 +326,7 @@ OBJ_SCDP := $(call obj_files,$(SRC_SCDP))
 OBJ_SCLP := $(call obj_files,$(SRC_SCLP))
 OBJ_SCSG := $(call obj_files,$(SRC_SCSG))
 OBJ_SCHS := $(call obj_files,$(SRC_SCHS))
+OBJ_SCMP := $(call obj_files,$(SRC_SCMP))
 OBJ_SAHD := $(call obj_files,$(SRC_SAHD))
 OBJ_SHARED := $(call obj_files,$(SRC_SHARED))
 OBJ_SHARED_PROTOBUF := $(call obj_files,$(SRC_SHARED_PROTOBUF))
@@ -329,7 +337,7 @@ OBJ_BUSES := $(call obj_files,$(SRC_BUSES))
 OBJ_CONTROLLERS := $(call obj_files,$(SRC_CONTROLLERS))
 OBJ_PI := $(call obj_files,$(SRC_PI))
 
-OBJ_DEVICES := $(shell echo $(OBJ_SCHD) $(OBJ_SCMO) $(OBJ_SCCD) $(OBJ_SCTP) $(OBJ_SCDP) $(OBJ_SCLP) $(OBJ_SCSG) $(OBJ_SCHS) $(OBJ_SAHD) | xargs -n1 | sort -u | xargs)
+OBJ_DEVICES := $(shell echo $(OBJ_SCHD) $(OBJ_SCMO) $(OBJ_SCCD) $(OBJ_SCTP) $(OBJ_SCDP) $(OBJ_SCLP) $(OBJ_SCSG) $(OBJ_SCHS) $(OBJ_SCMP) $(OBJ_SAHD) | xargs -n1 | sort -u | xargs)
 
 OBJ_S2P_CORE := $(call obj_files,$(SRC_S2P_CORE))
 OBJ_S2P := $(call obj_files,$(SRC_S2P))
