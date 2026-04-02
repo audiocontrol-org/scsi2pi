@@ -104,43 +104,41 @@ def _varint(value):
     result += bytes([value & 0x7f])
     return result
 
+def _read_varint(data, i):
+    """Read a varint from data at position i, return (value, new_i)."""
+    val = 0
+    shift = 0
+    while i < len(data):
+        b = data[i]
+        val |= (b & 0x7f) << shift
+        shift += 7
+        i += 1
+        if not (b & 0x80):
+            break
+    return val, i
+
 def parse_result(data):
-    """Very basic protobuf result parser."""
-    # Just look for the midi_response field and extract data
-    # This is a simplified parser — for production use the generated protobuf
+    """Protobuf result parser with proper multi-byte varint tag support."""
     i = 0
     fields = {}
     while i < len(data):
-        if i >= len(data):
-            break
-        tag = data[i]
+        tag, i = _read_varint(data, i)
         field_num = tag >> 3
         wire_type = tag & 0x07
-        i += 1
 
         if wire_type == 0:  # varint
-            val = 0
-            shift = 0
-            while i < len(data) and data[i] & 0x80:
-                val |= (data[i] & 0x7f) << shift
-                shift += 7
-                i += 1
-            if i < len(data):
-                val |= (data[i] & 0x7f) << shift
-                i += 1
+            val, i = _read_varint(data, i)
             fields[field_num] = val
         elif wire_type == 2:  # length-delimited
-            length = 0
-            shift = 0
-            while i < len(data) and data[i] & 0x80:
-                length |= (data[i] & 0x7f) << shift
-                shift += 7
-                i += 1
-            if i < len(data):
-                length |= (data[i] & 0x7f) << shift
-                i += 1
+            length, i = _read_varint(data, i)
             fields[field_num] = data[i:i+length]
             i += length
+        elif wire_type == 5:  # 32-bit fixed
+            fields[field_num] = data[i:i+4]
+            i += 4
+        elif wire_type == 1:  # 64-bit fixed
+            fields[field_num] = data[i:i+8]
+            i += 8
         else:
             break
 
@@ -175,8 +173,8 @@ def main():
             fields = parse_result(result)
             # midi_response is in a nested field
             print(f"  Raw fields: {fields}")
-            # Look for pending_bytes in the midi_response
-            if 101 in fields:  # field 101 = midi_response (oneof)
+            # midi_response is field 101 in PbResult
+            if 101 in fields:
                 midi_resp = parse_result(fields[101])
                 pending = midi_resp.get(2, 0)
                 print(f"  Pending bytes: {pending}")

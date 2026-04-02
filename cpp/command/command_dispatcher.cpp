@@ -368,6 +368,10 @@ void CommandDispatcher::ProcessMidiQueue()
         midi_queue.erase(midi_queue.begin());
     }
 
+    // Suspend SEL event monitoring — the kernel gpioevent handler holds PIN_SEL
+    // as INPUT, which conflicts with asserting SEL during initiator selection
+    bus.SuspendSelectionEvent();
+
     // Switch bus to initiator mode with settling delay
     bus.SetInitiatorMode(true);
     usleep(10000);  // 10ms settle time
@@ -423,6 +427,9 @@ void CommandDispatcher::ProcessMidiQueue()
 
     // Switch bus back to target mode
     bus.SetInitiatorMode(false);
+
+    // Resume SEL event monitoring for target mode
+    bus.ResumeSelectionEvent();
 
     // Signal completion
     {

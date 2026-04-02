@@ -35,6 +35,10 @@ public:
 
     uint8_t WaitForSelection() override;
 
+    void SetInitiatorMode(bool) const override;
+    void SuspendSelectionEvent() override;
+    void ResumeSelectionEvent() override;
+
     // Bus signal acquisition
     void Acquire() const override;
 

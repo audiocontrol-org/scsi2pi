@@ -170,13 +170,20 @@ public:
     }
 
     // Switch bus direction between target and initiator mode.
-    // In initiator mode: IND=true, DTD=false
-    // In target mode: IND=false, DTD=true
-    void SetInitiatorMode(bool initiator) const
+    // In initiator mode: IND=HIGH (drive initiator signals), DTD=LOW (drive data bus)
+    // In target mode: IND=LOW (listen for initiator signals), DTD=HIGH (read data bus)
+    virtual void SetInitiatorMode(bool initiator) const
     {
         SetSignal(PIN_IND, initiator);
         SetSignal(PIN_DTD, !initiator);
     }
+
+    // Suspend/resume SEL event monitoring for target/initiator mode switching.
+    // The kernel gpioevent handler holds PIN_SEL as INPUT, which conflicts with
+    // asserting SEL during initiator selection. These must be called around
+    // initiator operations.
+    virtual void SuspendSelectionEvent() {}
+    virtual void ResumeSelectionEvent() {}
 
 protected:
 

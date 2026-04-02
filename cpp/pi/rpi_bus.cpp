@@ -181,11 +181,74 @@ string RpiBus::SetUp(bool target)
     return "";
 }
 
+void RpiBus::SetInitiatorMode(bool initiator) const
+{
+    // Use PinSetSignal (GPIO_SET/GPIO_CLR) to drive the direction control pins,
+    // not SetSignal (GPFSEL manipulation). PIN_IND and PIN_DTD are board-level
+    // transceiver direction controls that must be actively driven HIGH or LOW.
+    PinSetSignal(PIN_IND, initiator);    // HIGH = initiator drives SEL/ATN/ACK/RST
+    PinSetSignal(PIN_DTD, !initiator);   // LOW = initiator drives data bus
+}
+
+void RpiBus::SuspendSelectionEvent()
+{
+#ifdef __linux__
+    if (epoll_fd >= 0) {
+        close(epoll_fd);
+        epoll_fd = -1;
+    }
+    if (selevreq.fd >= 0) {
+        close(selevreq.fd);
+        selevreq.fd = -1;
+    }
+#endif
+}
+
+void RpiBus::ResumeSelectionEvent()
+{
+#ifdef __linux__
+    const int fd = open("/dev/gpiochip0", 0);
+    if (fd == -1) {
+        warn("Can't open /dev/gpiochip0 to resume SEL event: {}", strerror(errno));
+        return;
+    }
+
+    strcpy(selevreq.consumer_label, "SCSI2Pi"); // NOSONAR Using strcpy is safe
+    selevreq.lineoffset = PIN_SEL;
+    selevreq.handleflags = GPIOHANDLE_REQUEST_INPUT;
+    selevreq.eventflags = GPIOEVENT_REQUEST_FALLING_EDGE;
+
+    if (ioctl(fd, GPIO_GET_LINEEVENT_IOCTL, &selevreq) == -1) {
+        warn("Can't re-register SEL event request: {}", strerror(errno));
+        close(fd);
+        return;
+    }
+    close(fd);
+
+    epoll_fd = epoll_create(1);
+    if (epoll_fd == -1) {
+        warn("Can't create epoll instance for SEL event: {}", strerror(errno));
+        return;
+    }
+
+    epoll_event ev = { };
+    ev.events = EPOLLIN | EPOLLPRI;
+    ev.data.fd = selevreq.fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, selevreq.fd, &ev) == -1) {
+        warn("Can't add SEL event fd to epoll: {}", strerror(errno));
+        close(epoll_fd);
+        epoll_fd = -1;
+    }
+#endif
+}
+
 void RpiBus::CleanUp()
 {
 #ifdef __linux__
     // Release SEL signal interrupt
-    close(selevreq.fd);
+    if (selevreq.fd >= 0) {
+        close(selevreq.fd);
+    }
 #endif
 
     // Set control signals
