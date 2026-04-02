@@ -33,7 +33,8 @@ using namespace s2p_util;
 
 MidiProcessor::MidiProcessor(int lun) : PrimaryDevice(SCMP, lun)
 {
-    SetProductData( { "ACORG", "MIDI Processor", "1.0" }, true);
+    // Use Akai-compatible vendor/product to satisfy S3000XL's INQUIRY check
+    SetProductData( { "AKAI", "S3000XL", "2.00" }, true);
     SetScsiLevel(ScsiLevel::SCSI_2);
     SupportsParams(true);
     SetReady(true);
