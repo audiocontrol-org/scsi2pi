@@ -13,6 +13,10 @@
 #include <csignal>
 #include <fstream>
 #include <iostream>
+#ifdef BUILD_SCMP
+#include "devices/midi_processor.h"
+#include "initiator/initiator_executor.h"
+#endif
 #include <sstream>
 #include <netinet/in.h>
 #include "base/device_factory.h"
@@ -484,6 +488,30 @@ void S2p::ProcessScsiCommands()
                 // Only when the bus is free SCSI2Pi or the Pi may be shut down.
                 dispatcher->ShutDown(shutdown_mode);
             }
+
+#ifdef BUILD_SCMP
+            // After target transaction completes, check if any SCMP device has
+            // queued initiator commands (e.g., SDS ACKs to send to the S3000XL).
+            for (auto device : controller_factory.GetAllDevices()) {
+                if (device->GetType() == SCMP) {
+                    auto *midi = dynamic_cast<MidiProcessor*>(device.get());
+                    if (midi && midi->HasPendingInitiatorCommands()) {
+                        auto cmd = midi->PopInitiatorCommand();
+                        auto &logger = midi->GetLogger();
+
+                        InitiatorExecutor initiator(*bus, 7, logger);  // Board ID 7
+                        initiator.SetTarget(cmd.target_id, 0, false);
+
+                        vector<uint8_t> cdb(cmd.cdb);
+                        int result = initiator.Execute(cdb, cmd.data,
+                            static_cast<int>(cmd.data.size()), 3, false);
+
+                        logger.warn(fmt::format("SCMP initiator: sent {} byte(s) to target {}, result={}",
+                            cmd.data.size(), cmd.target_id, result));
+                    }
+                }
+            }
+#endif
         }
     }
 }

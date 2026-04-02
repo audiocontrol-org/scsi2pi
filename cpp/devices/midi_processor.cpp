@@ -176,14 +176,16 @@ int MidiProcessor::WriteData(cdb_t cdb, data_out_t buf, int length)
         const uint8_t command = buf[3];
 
         if (command == 0x01) {
-            // Dump Header → ACK packet 0
-            LogWarn("MIDI: SDS Dump Header → ACK 0");
-            QueueSdsAck(channel, 0);
+            // Dump Header → send ACK to S3000XL via initiator command
+            LogWarn("MIDI: SDS Dump Header → queuing ACK to target");
+            vector<uint8_t> ack = { 0xf0, 0x7e, channel, 0x7f, 0x00, 0xf7 };
+            QueueSendToTarget(6, ack);
         } else if (command == 0x02 && data_len >= 5) {
-            // Data Packet → ACK packet number
+            // Data Packet → send ACK to S3000XL via initiator command
             const uint8_t pkt = buf[4];
-            LogWarn(fmt::format("MIDI: SDS Data Packet #{} → ACK", pkt));
-            QueueSdsAck(channel, pkt);
+            LogWarn(fmt::format("MIDI: SDS Data Packet #{} → queuing ACK to target", pkt));
+            vector<uint8_t> ack = { 0xf0, 0x7e, channel, 0x7f, pkt, 0xf7 };
+            QueueSendToTarget(6, ack);
         }
     }
 
@@ -230,6 +232,33 @@ void MidiProcessor::DrainSocket()
         LogWarn("MIDI socket: peer disconnected");
         DisconnectSocket();
     }
+}
+
+//---------------------------------------------------------------------------
+// Initiator command queue
+//---------------------------------------------------------------------------
+MidiProcessor::InitiatorCommand MidiProcessor::PopInitiatorCommand()
+{
+    auto cmd = std::move(initiator_queue.front());
+    initiator_queue.erase(initiator_queue.begin());
+    return cmd;
+}
+
+void MidiProcessor::QueueSendToTarget(int target_id, const vector<uint8_t> &sysex)
+{
+    InitiatorCommand cmd;
+    cmd.target_id = target_id;
+    // CDB: 0x0C with length in byte 4
+    cmd.cdb = { 0x0c, 0x00, 0x00, 0x00, static_cast<uint8_t>(sysex.size()), 0x00 };
+    cmd.data = sysex;
+
+    string hex;
+    for (size_t i = 0; i < min(sysex.size(), (size_t)12); ++i)
+        hex += fmt::format("{:02x} ", sysex[i]);
+    LogWarn(fmt::format("MIDI: queued initiator 0x0C to target {}: {} ({} bytes)",
+        target_id, hex, sysex.size()));
+
+    initiator_queue.push_back(std::move(cmd));
 }
 
 //---------------------------------------------------------------------------

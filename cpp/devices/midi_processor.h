@@ -51,12 +51,23 @@ public:
 
     vector<PbStatistics> GetStatistics() const override;
 
+    // Initiator command queue — commands to send TO the S3000XL
+    struct InitiatorCommand {
+        int target_id;
+        vector<uint8_t> cdb;
+        vector<uint8_t> data;
+    };
+
+    bool HasPendingInitiatorCommands() const { return !initiator_queue.empty(); }
+    InitiatorCommand PopInitiatorCommand();
+
 private:
 
-    // SysEx response buffer — queued bytes to be read by initiator via 0x09
     vector<uint8_t> response_buffer;
+    vector<InitiatorCommand> initiator_queue;
 
     void QueueSdsAck(uint8_t channel, uint8_t packet_number);
+    void QueueSendToTarget(int target_id, const vector<uint8_t> &sysex);
     void DrainSocket();
 
     bool ConnectSocket();
