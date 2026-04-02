@@ -97,41 +97,12 @@ vector<uint8_t> MidiProcessor::HandleInquiry() const
 //---------------------------------------------------------------------------
 void MidiProcessor::RetrieveStats()
 {
-    const int allocation_length = GetCdbInt16(3);
-
-    if (allocation_length == 0) {
-        StatusPhase();
-        return;
-    }
-
-    auto &buf = GetController()->GetBuffer();
-
-    // Try to connect if not connected
-    if (sock_fd < 0) {
-        ConnectSocket();
-    }
-
-    int bytes_read = 0;
-    if (sock_fd >= 0) {
-        // Poll to see if data is available (non-blocking)
-        pollfd pfd = { .fd = sock_fd, .events = POLLIN, .revents = 0 };
-        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
-            bytes_read = SocketRead(span(buf.data(), min(static_cast<int>(buf.size()), allocation_length)));
-            if (bytes_read < 0) {
-                bytes_read = 0;
-            }
-        }
-    }
-
-    if (bytes_read > 0) {
-        byte_read_count += bytes_read;
-        LogDebug(fmt::format("MIDI Processor: read {} byte(s) from socket", bytes_read));
-    }
-
-    const int length = min(bytes_read, allocation_length);
-    GetController()->SetTransferSize(length, length);
-
-    DataInPhase(length);
+    // The S3000XL sends RETRIEVE STATS (0x09) during initialization.
+    // For now, return GOOD status. When the socket bridge is connected,
+    // this will return queued MIDI data.
+    // TODO: implement socket read for MIDI IN path
+    LogDebug("MIDI Processor: RetrieveStats - returning GOOD (no data)");
+    StatusPhase();
 }
 
 //---------------------------------------------------------------------------
@@ -212,15 +183,10 @@ int MidiProcessor::WriteData(cdb_t cdb, data_out_t buf, int length)
 //---------------------------------------------------------------------------
 void MidiProcessor::SetInterfaceMode() const
 {
-    const int length = GetCdbByte(4);
-
-    if (length > 0) {
-        GetController()->SetTransferSize(length, length);
-        DataOutPhase(length);
-    }
-    else {
-        StatusPhase();
-    }
+    // The S3000XL sends config data via 0x0C but we don't need it.
+    // Accept with GOOD status regardless of transfer length.
+    // Attempting DataOutPhase causes transfer size errors with the S3000XL.
+    StatusPhase();
 }
 
 //---------------------------------------------------------------------------
