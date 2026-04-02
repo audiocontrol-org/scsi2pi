@@ -1,67 +1,65 @@
 #!/usr/bin/env bash
 #
-# Automated SCMP test cycle.
-# Builds, deploys to Pi, starts s2p with SCMP, waits for S3000XL activity,
-# then dumps the trace.
+# End-to-end SCSI MIDI test.
+# Builds, deploys, and runs an SDS round-trip via SCSI.
 #
-# Usage:
-#   ./scripts/test-scmp.sh [response_hex_bytes]
-#
-# Examples:
-#   ./scripts/test-scmp.sh                    # Use default response (00 00 00)
-#   ./scripts/test-scmp.sh "00 00 00"         # Explicit 3-byte response
-#   ./scripts/test-scmp.sh "f0 7e 00 7f 00 f7"  # Full SDS ACK
-#   ./scripts/test-scmp.sh "01 00 00"         # Try ready flag
-#
-# Requires:
-#   - Pi at s3k.local with passwordless sudo for /tmp/s2p-midi
-#   - Docker for cross-compilation
-#   - S3000XL connected and configured for MIDI-via-SCSI to ID 0
+# Usage: ./scripts/test-scmp.sh [sample_number]
 
 set -euo pipefail
 
 PI="orion@s3k.local"
-RESPONSE_HEX="${1:-}"
-WAIT_SECS="${2:-30}"
+SAMPLE="${1:-99}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(dirname "$SCRIPT_DIR")"
 
-# Step 1: Build
 echo "=== Building ==="
-cd "$(dirname "$0")/.."
+cd "$ROOT"
 docker run --rm --platform linux/arm64 -v "$(pwd)":/src -w /src/cpp scsi2pi-build bash -c "make -j4 2>&1 | tail -2"
 
-# Step 2: Deploy
 echo "=== Deploying ==="
 scp cpp/bin/s2p ${PI}:/tmp/s2p-midi
+scp scripts/scsi-midi-test.py ${PI}:/tmp/scsi-midi-test.py
 
-# Step 3: Set response bytes on Pi
-if [ -n "$RESPONSE_HEX" ]; then
-    echo "=== Setting 0x0D response: $RESPONSE_HEX ==="
-    # Convert hex string to binary file
-    ssh ${PI} "echo '$RESPONSE_HEX' | xxd -r -p > /tmp/scmp-response.bin && xxd /tmp/scmp-response.bin"
-else
-    echo "=== Using default 0x0D response (from /tmp/scmp-response.bin or 00 00 00) ==="
-fi
+echo "=== Stopping old processes ==="
+ssh ${PI} "sudo killall s2p-midi 2>/dev/null; rm -f /tmp/scsi-midi-bridge.sock /tmp/s2p-capture.log; true"
 
-# Step 4: Start s2p + attach SCMP
-echo "=== Starting s2p with SCMP at ID 0 ==="
-ssh ${PI} "rm -f /tmp/s2p-capture.log
+echo "=== Starting test harness + s2p ==="
+ssh ${PI} "
+# Start test harness in background (creates socket server)
+python3 /tmp/scsi-midi-test.py ${SAMPLE} > /tmp/scsi-midi-test.log 2>&1 &
+TEST_PID=\$!
+echo \"Test harness PID: \$TEST_PID\"
+sleep 1
+
+# Start s2p with SCMP
 sudo /tmp/s2p-midi --ignore-conf -L trace --log-limit 0 >/tmp/s2p-capture.log 2>&1 &
+S2P_PID=\$!
+echo \"s2p PID: \$S2P_PID\"
 sleep 2
-/tmp/s2pctl-midi -i 0 -c attach -t SCMP 2>&1
-echo 'SCMP attached. Trigger dump on S3000XL now.'
-echo 'Waiting ${WAIT_SECS} seconds...'
-sleep ${WAIT_SECS}
-echo '=== Trace summary ==='
-echo \"Lines: \$(wc -l < /tmp/s2p-capture.log)\"
-echo ''
-strings /tmp/s2p-capture.log | grep -E 'executing|0x0C config|0x0D response|Receiving|Received|Timeout|RESET'
-echo ''
-echo '=== Unique commands ==='
-strings /tmp/s2p-capture.log | grep 'executing' | sort -u
-"
 
-# Step 5: Kill s2p
-echo "=== Cleaning up ==="
-ssh ${PI} "sudo killall s2p-midi 2>/dev/null || true"
+# Attach SCMP
+/tmp/s2pctl-midi -i 0 -c attach -t SCMP 2>&1
+
+echo 'Waiting for test to complete (60s max)...'
+for i in \$(seq 1 60); do
+  if ! kill -0 \$TEST_PID 2>/dev/null; then
+    echo \"Test harness exited after \${i}s\"
+    break
+  fi
+  sleep 1
+done
+
+# Kill remaining processes
+kill \$TEST_PID 2>/dev/null || true
+sudo killall s2p-midi 2>/dev/null || true
+
+echo ''
+echo '=== Test harness output ==='
+cat /tmp/scsi-midi-test.log
+
+echo ''
+echo '=== SCSI trace (key events) ==='
+strings /tmp/s2p-capture.log | grep -E 'MIDI|executing|Receiving|Received|Sending|Timeout|RESET' | head -50
+" 2>&1
 
 echo "=== Done ==="

@@ -7,10 +7,17 @@
 //
 // Copyright (C) 2026 AudioControl
 //
+// Protocol (Akai MIDI-via-SCSI):
+//   0x0C (SET_IFACE_MODE):  Initiator sends MIDI SysEx to target (DATA OUT)
+//   0x0D (SET_MCAST_ADDR):  Initiator polls target for pending bytes (DATA IN, 3 bytes)
+//                           Response: 00 HH LL where HHLL = queued byte count
+//   0x09 (RETRIEVE_STATS):  Initiator reads pending SysEx from target (DATA IN)
+//
 //---------------------------------------------------------------------------
 
 #pragma once
 
+#include <vector>
 #include "base/primary_device.h"
 
 class MidiProcessor final : public PrimaryDevice
@@ -36,14 +43,21 @@ public:
     vector<uint8_t> HandleInquiry() const override;
     int WriteData(cdb_t, data_out_t, int) override;
 
-    void RetrieveStats();
-    void SetInterfaceMode() const;
-    void SendData() const;
-    void EnableInterface() const;
+    // SCSI command handlers
+    void RetrieveStats();      // 0x09 — read queued SysEx response
+    void SetInterfaceMode();   // 0x0C — receive MIDI SysEx from initiator (not const: modifies buffer)
+    void SendData();           // 0x0D — poll: return pending byte count (not const: reads buffer)
+    void EnableInterface() const; // 0x0E — accept with GOOD
 
     vector<PbStatistics> GetStatistics() const override;
 
 private:
+
+    // SysEx response buffer — queued bytes to be read by initiator via 0x09
+    vector<uint8_t> response_buffer;
+
+    void QueueSdsAck(uint8_t channel, uint8_t packet_number);
+    void DrainSocket();
 
     bool ConnectSocket();
     void DisconnectSocket();

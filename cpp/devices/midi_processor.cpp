@@ -7,15 +7,15 @@
 //
 // Copyright (C) 2026 AudioControl
 //
-// The Akai S3000XL uses SCSI processor device commands to send and receive
-// MIDI SysEx data over SCSI. The opcodes match DaynaPort SCSI/Link:
-//   0x09 RETRIEVE_STATS  - read data from this device (MIDI IN)
-//   0x0C SET_IFACE_MODE  - configuration data (accept and ignore)
-//   0x0D SET_MCAST_ADDR  - send data to this device (MIDI OUT)
-//   0x0E ENABLE_INTERFACE - enable interface (accept with GOOD)
+// Protocol (Akai MIDI-via-SCSI):
+//   0x0C (SET_IFACE_MODE):  Initiator sends MIDI SysEx to target (DATA OUT)
+//   0x0D (SET_MCAST_ADDR):  Initiator polls target for pending bytes (DATA IN)
+//                           Response: 3 bytes, 00 HH LL = queued byte count
+//   0x09 (RETRIEVE_STATS):  Initiator reads pending SysEx from target (DATA IN)
 //
-// Instead of a TAP network interface, this device relays data through a
-// Unix domain socket to a MIDI bridge process.
+// The SCMP device relays SysEx bidirectionally between the SCSI bus and
+// a Unix domain socket. A bridge daemon connects to the socket and
+// controls the MIDI conversation.
 //
 //---------------------------------------------------------------------------
 
@@ -24,6 +24,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <poll.h>
+#include <cstring>
 #include "controllers/abstract_controller.h"
 #include "shared/s2p_exceptions.h"
 
@@ -33,7 +34,6 @@ using namespace s2p_util;
 
 MidiProcessor::MidiProcessor(int lun) : PrimaryDevice(SCMP, lun)
 {
-    // Use Akai-compatible vendor/product to satisfy S3000XL's INQUIRY check
     SetProductData( { "AKAI", "S3000XL", "2.00" }, true);
     SetScsiLevel(ScsiLevel::SCSI_2);
     SupportsParams(true);
@@ -42,35 +42,18 @@ MidiProcessor::MidiProcessor(int lun) : PrimaryDevice(SCMP, lun)
 
 string MidiProcessor::SetUp()
 {
-    AddCommand(ScsiCommand::RETRIEVE_STATS, [this]
-        {
-            RetrieveStats();
-        });
-    AddCommand(ScsiCommand::SET_IFACE_MODE, [this]
-        {
-            SetInterfaceMode();
-        });
-    AddCommand(ScsiCommand::SET_MCAST_ADDR, [this]
-        {
-            SendData();
-        });
-    AddCommand(ScsiCommand::ENABLE_INTERFACE, [this]
-        {
-            EnableInterface();
-        });
+    AddCommand(ScsiCommand::RETRIEVE_STATS, [this] { RetrieveStats(); });
+    AddCommand(ScsiCommand::SET_IFACE_MODE, [this] { SetInterfaceMode(); });
+    AddCommand(ScsiCommand::SET_MCAST_ADDR, [this] { SendData(); });
+    AddCommand(ScsiCommand::ENABLE_INTERFACE, [this] { EnableInterface(); });
 
-    // Get socket path from params, or use default
-    if (const auto &it = GetParams().find(SOCKET_PATH_PARAM); it != GetParams().end()) {
-        socket_path = it->second;
-    }
-    else {
-        socket_path = DEFAULT_SOCKET_PATH;
-    }
+    socket_path = "/tmp/scsi-midi-bridge.sock";
 
-    LogDebug(fmt::format("MIDI Processor configured with socket path: {}", socket_path));
+    LogWarn(fmt::format("MIDI Processor: socket={}", socket_path));
 
+    // Try to connect eagerly — the test harness/bridge should already be listening
     if (!ConnectSocket()) {
-        LogWarn(fmt::format("MIDI Processor: could not connect to socket '{}' (will retry on I/O)", socket_path));
+        LogWarn("MIDI Processor: socket not available yet (will retry on I/O)");
     }
 
     return "";
@@ -87,241 +70,215 @@ vector<uint8_t> MidiProcessor::HandleInquiry() const
 }
 
 //---------------------------------------------------------------------------
-//
-// RetrieveStats (0x09) - Read data from the MIDI bridge (MIDI IN)
-//
-// The S3000XL sends: 09 00 00 00 LL 00
-// Transfer length is in CDB byte 4 (1 byte) for DaynaPort-style,
-// but for a processor SEND/RECEIVE the length field is bytes 2-4.
-// We read what's available from the socket and return it.
-//
+// 0x09 — RETRIEVE STATS: Read queued SysEx from response_buffer
 //---------------------------------------------------------------------------
 void MidiProcessor::RetrieveStats()
 {
-    // The S3000XL sends RETRIEVE STATS (0x09) during initialization.
-    // For now, return GOOD status. When the socket bridge is connected,
-    // this will return queued MIDI data.
-    // TODO: implement socket read for MIDI IN path
-    LogDebug("MIDI Processor: RetrieveStats - returning GOOD (no data)");
+    if (response_buffer.empty()) {
+        StatusPhase();
+        return;
+    }
+
+    auto &buf = GetController()->GetBuffer();
+    const int to_send = static_cast<int>(response_buffer.size());
+    memcpy(buf.data(), response_buffer.data(), to_send);
+
+    string hex;
+    for (int i = 0; i < min(to_send, 20); ++i)
+        hex += fmt::format("{:02x} ", response_buffer[i]);
+    if (to_send > 20) hex += "...";
+    LogWarn(fmt::format("MIDI 0x09: sending {} byte(s): {}", to_send, hex));
+
+    response_buffer.clear();
+    GetController()->SetTransferSize(to_send, to_send);
+    DataInPhase(to_send);
+}
+
+//---------------------------------------------------------------------------
+// 0x0C — SET INTERFACE MODE: Receive MIDI SysEx from initiator
+//---------------------------------------------------------------------------
+void MidiProcessor::SetInterfaceMode()
+{
+    const int length = GetCdbByte(4);
+    if (length > 0) {
+        DataOutPhase(length);
+    } else {
+        StatusPhase();
+    }
+}
+
+//---------------------------------------------------------------------------
+// 0x0D — SET MCAST ADDR: Poll — return pending byte count
+//
+// Before responding, drain any pending bytes from the socket into
+// response_buffer. This is how the bridge daemon injects SysEx
+// messages (dump requests, ACKs, etc.) for the S3000XL to read.
+//---------------------------------------------------------------------------
+void MidiProcessor::SendData()
+{
+    // Drain socket into response_buffer
+    DrainSocket();
+
+    auto &buf = GetController()->GetBuffer();
+    const int pending = static_cast<int>(response_buffer.size());
+    buf[0] = 0x00;
+    buf[1] = static_cast<uint8_t>((pending >> 8) & 0xff);
+    buf[2] = static_cast<uint8_t>(pending & 0xff);
+
+    if (pending > 0) {
+        LogWarn(fmt::format("MIDI 0x0D: {} byte(s) pending", pending));
+    }
+
+    GetController()->SetTransferSize(3, 3);
+    DataInPhase(3);
+}
+
+//---------------------------------------------------------------------------
+// 0x0E — ENABLE INTERFACE: Accept with GOOD
+//---------------------------------------------------------------------------
+void MidiProcessor::EnableInterface() const
+{
     StatusPhase();
 }
 
 //---------------------------------------------------------------------------
+// WriteData — Called after DataOutPhase for 0x0C
 //
-// SendData (0x0D / SET_MCAST_ADDR) - Write data to the MIDI bridge (MIDI OUT)
-//
-// The S3000XL sends: 0D 00 LL LL LL 00
-// Transfer length is CDB bytes 2-4 (3 bytes, big-endian) for a 6-byte
-// processor SEND command.
-//
-// For a 0-byte probe (0D 00 00 00 00 00), return GOOD status without
-// throwing an error. DaynaPort throws ILLEGAL_REQUEST for length==0,
-// but the S3000XL expects GOOD.
-//
-//---------------------------------------------------------------------------
-void MidiProcessor::SendData() const
-{
-    // The S3000XL sends MIDI SysEx data via 0x0D.
-    // Parse transfer length: try byte 4, then bytes 2-4.
-    int length = GetCdbByte(4);
-    if (length == 0) {
-        length = GetCdbInt24(2);
-    }
-
-    if (length == 0) {
-        // Vendor 0x0D: DATA IN response.
-        // Read response bytes from /tmp/scmp-response.bin if it exists,
-        // otherwise default to 3 bytes of 0x00.
-        // This allows runtime experimentation without recompiling.
-        auto &buf = GetController()->GetBuffer();
-        int resp_len = 3;
-        memset(buf.data(), 0, resp_len);
-
-        FILE *f = fopen("/tmp/scmp-response.bin", "rb");
-        if (f) {
-            resp_len = static_cast<int>(fread(buf.data(), 1, 256, f));
-            fclose(f);
-            if (resp_len < 1) resp_len = 3;
-        }
-
-        string hex;
-        for (int i = 0; i < resp_len; ++i) {
-            hex += fmt::format("{:02x} ", static_cast<uint8_t>(buf[i]));
-        }
-        LogWarn(fmt::format("MIDI 0x0D response ({} bytes): {}", resp_len, hex));
-
-        GetController()->SetTransferSize(resp_len, resp_len);
-        DataInPhase(resp_len);
-        return;
-    }
-
-    LogDebug(fmt::format("MIDI SEND: accepting {} byte(s)", length));
-    DataOutPhase(length);
-}
-
-//---------------------------------------------------------------------------
-//
-// WriteData - Called after DataOutPhase completes for SET_MCAST_ADDR
-// and SET_IFACE_MODE.
-//
+// Receives MIDI SysEx from the S3000XL. Writes it to the socket for
+// the bridge daemon. Also auto-generates SDS ACKs for closed-loop
+// handshaking (the bridge daemon may not respond fast enough for
+// SCSI timing requirements).
 //---------------------------------------------------------------------------
 int MidiProcessor::WriteData(cdb_t cdb, data_out_t buf, int length)
 {
-    const auto opcode = static_cast<ScsiCommand>(cdb[0]);
-
-    if (opcode == ScsiCommand::SET_MCAST_ADDR) {
-        // MIDI OUT: write the received data to the socket
-        if (sock_fd < 0) {
-            ConnectSocket();
-        }
-
-        if (sock_fd >= 0) {
-            const int written = SocketWrite(buf);
-            if (written > 0) {
-                byte_write_count += written;
-                LogDebug(fmt::format("MIDI Processor: wrote {} byte(s) to socket", written));
-            }
-            else {
-                LogWarn("MIDI Processor: failed to write data to socket");
-            }
-        }
-        else {
-            LogWarn("MIDI Processor: socket not connected, dropping MIDI data");
-        }
+    if (static_cast<ScsiCommand>(cdb[0]) != ScsiCommand::SET_IFACE_MODE) {
+        return length;
     }
-    else if (opcode == ScsiCommand::SET_IFACE_MODE) {
-        // Log config data in hex for protocol analysis
-        // buf contains the received data; use buf.size() for actual byte count
-        const int data_len = static_cast<int>(buf.size());
-        string hex;
-        for (int i = 0; i < data_len; ++i) {
-            hex += fmt::format("{:02x} ", static_cast<uint8_t>(buf[i]));
+
+    const int data_len = static_cast<int>(buf.size());
+
+    // Log received data
+    string hex;
+    for (int i = 0; i < min(data_len, 24); ++i)
+        hex += fmt::format("{:02x} ", static_cast<uint8_t>(buf[i]));
+    if (data_len > 24) hex += "...";
+    LogWarn(fmt::format("MIDI 0x0C: received {} byte(s): {}", data_len, hex));
+
+    // Write to socket for bridge daemon
+    if (sock_fd < 0) ConnectSocket();
+    if (sock_fd >= 0) {
+        SocketWrite(buf);
+    }
+
+    // Auto-generate SDS ACK for closed-loop handshaking
+    if (data_len >= 4 && buf[0] == 0xf0 && buf[1] == 0x7e) {
+        const uint8_t channel = buf[2];
+        const uint8_t command = buf[3];
+
+        if (command == 0x01) {
+            // Dump Header → ACK packet 0
+            LogWarn("MIDI: SDS Dump Header → ACK 0");
+            QueueSdsAck(channel, 0);
+        } else if (command == 0x02 && data_len >= 5) {
+            // Data Packet → ACK packet number
+            const uint8_t pkt = buf[4];
+            LogWarn(fmt::format("MIDI: SDS Data Packet #{} → ACK", pkt));
+            QueueSdsAck(channel, pkt);
         }
-        LogWarn(fmt::format("MIDI Processor: 0x0C config ({} bytes): {}", data_len, hex));
     }
 
     return length;
 }
 
 //---------------------------------------------------------------------------
-//
-// SetInterfaceMode (0x0C) - Accept configuration data
-//
-// The S3000XL sends 84 bytes of configuration data via this command.
-// We accept it and ignore the contents.
-//
+// QueueSdsAck — Put an SDS ACK in the response buffer
 //---------------------------------------------------------------------------
-void MidiProcessor::SetInterfaceMode() const
+void MidiProcessor::QueueSdsAck(uint8_t channel, uint8_t packet_number)
 {
-    // The S3000XL sends config data via 0x0C.
-    // CDB byte 4 contains the transfer length.
-    // Must enter DATA OUT to accept the data — the S3000XL expects to
-    // write data and will timeout on MESSAGE IN if we skip to STATUS.
-    const int length = GetCdbByte(4);
+    response_buffer.clear();
+    response_buffer.push_back(0xf0);
+    response_buffer.push_back(0x7e);
+    response_buffer.push_back(channel);
+    response_buffer.push_back(0x7f);  // ACK
+    response_buffer.push_back(packet_number);
+    response_buffer.push_back(0xf7);
+}
 
-    if (length > 0) {
-        DataOutPhase(length);
-    }
-    else {
-        StatusPhase();
+//---------------------------------------------------------------------------
+// DrainSocket — Read any pending bytes from socket into response_buffer
+//---------------------------------------------------------------------------
+void MidiProcessor::DrainSocket()
+{
+    if (sock_fd < 0) ConnectSocket();
+    if (sock_fd < 0) return;
+
+    pollfd pfd = { .fd = sock_fd, .events = POLLIN, .revents = 0 };
+    if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN)) return;
+
+    // Only read if response_buffer is empty (don't overwrite pending ACK)
+    if (!response_buffer.empty()) return;
+
+    uint8_t tmp[4096];
+    const ssize_t n = recv(sock_fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+    if (n > 0) {
+        response_buffer.assign(tmp, tmp + n);
+        string hex;
+        for (int i = 0; i < min(static_cast<int>(n), 20); ++i)
+            hex += fmt::format("{:02x} ", tmp[i]);
+        LogWarn(fmt::format("MIDI socket: read {} byte(s): {}", n, hex));
+    } else if (n == 0) {
+        LogWarn("MIDI socket: peer disconnected");
+        DisconnectSocket();
     }
 }
 
 //---------------------------------------------------------------------------
-//
-// EnableInterface (0x0E) - Accept with GOOD status
-//
-//---------------------------------------------------------------------------
-void MidiProcessor::EnableInterface() const
-{
-    LogDebug("MIDI Processor: EnableInterface");
-    StatusPhase();
-}
-
-//---------------------------------------------------------------------------
-//
-// Socket helpers - Unix domain socket connection to the MIDI bridge
-//
+// Socket helpers
 //---------------------------------------------------------------------------
 bool MidiProcessor::ConnectSocket()
 {
     DisconnectSocket();
-
     sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock_fd < 0) {
-        LogWarn(fmt::format("MIDI Processor: failed to create socket: {}", strerror(errno)));
-        return false;
-    }
+    if (sock_fd < 0) return false;
 
     sockaddr_un addr = {};
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
 
     if (connect(sock_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        LogWarn(fmt::format("MIDI Processor: failed to connect to '{}': {}", socket_path, strerror(errno)));
         close(sock_fd);
         sock_fd = -1;
         return false;
     }
-
-    LogDebug(fmt::format("MIDI Processor: connected to socket '{}'", socket_path));
+    LogWarn(fmt::format("MIDI socket: connected to {}", socket_path));
     return true;
 }
 
 void MidiProcessor::DisconnectSocket()
 {
-    if (sock_fd >= 0) {
-        close(sock_fd);
-        sock_fd = -1;
-    }
+    if (sock_fd >= 0) { close(sock_fd); sock_fd = -1; }
 }
 
 int MidiProcessor::SocketRead(span<uint8_t> buf)
 {
-    if (sock_fd < 0) {
-        return -1;
-    }
-
-    const ssize_t result = recv(sock_fd, buf.data(), buf.size(), 0);
-    if (result < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            LogWarn(fmt::format("MIDI Processor: socket read error: {}", strerror(errno)));
-            DisconnectSocket();
-        }
-        return -1;
-    }
-    if (result == 0) {
-        // Connection closed
-        LogWarn("MIDI Processor: socket connection closed by peer");
-        DisconnectSocket();
-        return -1;
-    }
-
-    return static_cast<int>(result);
+    if (sock_fd < 0) return -1;
+    const ssize_t r = recv(sock_fd, buf.data(), buf.size(), 0);
+    if (r <= 0) { DisconnectSocket(); return -1; }
+    return static_cast<int>(r);
 }
 
 int MidiProcessor::SocketWrite(span<const uint8_t> buf)
 {
-    if (sock_fd < 0) {
-        return -1;
-    }
-
-    const ssize_t result = send(sock_fd, buf.data(), buf.size(), 0);
-    if (result < 0) {
-        LogWarn(fmt::format("MIDI Processor: socket write error: {}", strerror(errno)));
-        DisconnectSocket();
-        return -1;
-    }
-
-    return static_cast<int>(result);
+    if (sock_fd < 0) return -1;
+    const ssize_t r = send(sock_fd, buf.data(), buf.size(), 0);
+    if (r <= 0) { DisconnectSocket(); return -1; }
+    return static_cast<int>(r);
 }
 
 vector<PbStatistics> MidiProcessor::GetStatistics() const
 {
     vector<PbStatistics> statistics = PrimaryDevice::GetStatistics();
-
     EnrichStatistics(statistics, CATEGORY_INFO, BYTE_READ_COUNT, byte_read_count);
     EnrichStatistics(statistics, CATEGORY_INFO, BYTE_WRITE_COUNT, byte_write_count);
-
     return statistics;
 }
