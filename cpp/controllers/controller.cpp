@@ -215,6 +215,18 @@ void Controller::Status()
         return;
     }
 
+    // Vendor command 0x0D on SCMP: the S3000XL doesn't ACK STATUS for this.
+    // Skip STATUS/MESSAGE IN and go to BUS FREE.
+    const auto opcode = static_cast<ScsiCommand>(GetCdb()[0]);
+    if (opcode == ScsiCommand::SET_MCAST_ADDR) {
+        const auto device = GetDeviceForLun(GetEffectiveLun());
+        if (device && device->GetType() == SCMP) {
+            LogTrace("Skipping STATUS/MESSAGE IN for vendor command 0x0D (SCMP)");
+            BusFree();
+            return;
+        }
+    }
+
     LogTrace(fmt::format("STATUS phase, status is {} (status code ${:02x})", STATUS_MAPPING.at(GetStatus()),
         static_cast<int>(GetStatus())));
 

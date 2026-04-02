@@ -129,12 +129,13 @@ void MidiProcessor::SendData() const
     }
 
     if (length == 0) {
-        // Zero-length CDB. The S3000XL doesn't send data for this.
-        // Neither StatusPhase (MESSAGE IN timeout) nor DataOutPhase
-        // (no bytes received) works. Try DataInPhase — maybe the
-        // S3000XL expects a response acknowledging the SEND capability.
-        LogDebug("MIDI SEND: zero-length, trying DATA IN with 0 bytes");
-        DataInPhase(0);
+        // Vendor 0x0D with zero CDB length is a DATA IN command.
+        // The S3000XL reads exactly 3 bytes from the target.
+        auto &buf = GetController()->GetBuffer();
+        memset(buf.data(), 0, 3);
+        GetController()->SetTransferSize(3, 3);
+        LogDebug("MIDI SEND: responding with 3-byte DATA IN");
+        DataInPhase(3);
         return;
     }
 
