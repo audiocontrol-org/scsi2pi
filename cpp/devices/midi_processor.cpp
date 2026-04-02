@@ -120,16 +120,22 @@ void MidiProcessor::RetrieveStats()
 //---------------------------------------------------------------------------
 void MidiProcessor::SendData() const
 {
-    const int length = GetCdbInt24(2);
+    // The S3000XL sends MIDI SysEx data via 0x0D.
+    // CDB byte 4 may contain the transfer length, or the length may be
+    // encoded differently. Try byte 4 first, fall back to bytes 2-4.
+    int length = GetCdbByte(4);
+    if (length == 0) {
+        length = GetCdbInt24(2);
+    }
 
     if (length == 0) {
-        // Probe: S3000XL sends 0-byte SET_MCAST_ADDR to test if device is present
-        StatusPhase();
-        return;
+        // True zero-length — the S3000XL still expects DATA OUT phase.
+        // Accept a small buffer to see what it sends.
+        length = 65536;
+        LogDebug(fmt::format("MIDI SEND: CDB has zero length, accepting up to {} bytes", length));
     }
 
     GetController()->SetTransferSize(length, length);
-
     DataOutPhase(length);
 }
 
@@ -183,10 +189,19 @@ int MidiProcessor::WriteData(cdb_t cdb, data_out_t buf, int length)
 //---------------------------------------------------------------------------
 void MidiProcessor::SetInterfaceMode() const
 {
-    // The S3000XL sends config data via 0x0C but we don't need it.
-    // Accept with GOOD status regardless of transfer length.
-    // Attempting DataOutPhase causes transfer size errors with the S3000XL.
-    StatusPhase();
+    // The S3000XL sends config data via 0x0C.
+    // CDB byte 4 contains the transfer length.
+    // We MUST enter DATA OUT phase to accept the data — returning
+    // StatusPhase directly causes the S3000XL to timeout on MESSAGE IN.
+    const int length = GetCdbByte(4);
+
+    if (length > 0) {
+        GetController()->SetTransferSize(length, length);
+        DataOutPhase(length);
+    }
+    else {
+        StatusPhase();
+    }
 }
 
 //---------------------------------------------------------------------------
