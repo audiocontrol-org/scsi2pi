@@ -132,9 +132,13 @@ void MidiProcessor::SendData() const
         // Vendor 0x0D with zero CDB length is a DATA IN command.
         // The S3000XL reads exactly 3 bytes from the target.
         auto &buf = GetController()->GetBuffer();
-        memset(buf.data(), 0, 3);
+        // 3-byte response to 0x0D poll.
+        // Try Akai identifiers: manufacturer (0x47), device (0x48), channel (0x00)
+        buf[0] = 0x47;  // Akai manufacturer ID
+        buf[1] = 0x00;  // SysEx channel
+        buf[2] = 0x48;  // S3000XL device ID
         GetController()->SetTransferSize(3, 3);
-        LogDebug("MIDI SEND: responding with 3-byte DATA IN");
+        LogDebug("MIDI SEND: responding with 3-byte DATA IN [01 00 00]");
         DataInPhase(3);
         return;
     }
