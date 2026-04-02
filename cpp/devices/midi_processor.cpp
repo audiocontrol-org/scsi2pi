@@ -178,8 +178,14 @@ int MidiProcessor::WriteData(cdb_t cdb, data_out_t buf, int length)
         }
     }
     else if (opcode == ScsiCommand::SET_IFACE_MODE) {
-        // Configuration data: accept and ignore
-        LogDebug(fmt::format("MIDI Processor: accepted {} byte(s) of config data", length));
+        // Log config data in hex for protocol analysis
+        // buf contains the received data; use buf.size() for actual byte count
+        const int data_len = static_cast<int>(buf.size());
+        string hex;
+        for (int i = 0; i < data_len; ++i) {
+            hex += fmt::format("{:02x} ", static_cast<uint8_t>(buf[i]));
+        }
+        LogWarn(fmt::format("MIDI Processor: 0x0C config ({} bytes): {}", data_len, hex));
     }
 
     return length;
