@@ -14,6 +14,7 @@
 #include "shared/s2p_defs.h"
 #include "generated/s2p_interface.pb.h"
 
+class Bus;
 class CommandContext;
 class CommandExecutor;
 class ControllerFactory;
@@ -26,8 +27,8 @@ class CommandDispatcher final
 
 public:
 
-    CommandDispatcher(CommandExecutor &e, ControllerFactory &f, logger &l) : executor(e), controller_factory(f), s2p_logger(
-        l)
+    CommandDispatcher(CommandExecutor &e, ControllerFactory &f, Bus &b, logger &l)
+    : executor(e), controller_factory(f), bus(b), s2p_logger(l)
     {
     }
     ~CommandDispatcher() = default;
@@ -45,9 +46,13 @@ private:
     bool HandleDeviceListChange(const CommandContext&) const;
     bool ShutDown(const CommandContext&) const;
 
+    bool ExecuteMidi(const CommandContext&, PbResult&);
+
     CommandExecutor &executor;
 
     ControllerFactory &controller_factory;
+
+    Bus &bus;
 
     logger &s2p_logger;
 

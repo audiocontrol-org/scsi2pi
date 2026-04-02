@@ -252,7 +252,7 @@ TEST(HostServicesTest, SetDispatcher)
     ControllerFactory controller_factory;
     MockBus bus;
     CommandExecutor executor(bus, controller_factory, *default_logger());
-    auto dispatcher = make_shared<CommandDispatcher>(executor, controller_factory, *default_logger());
+    auto dispatcher = make_shared<CommandDispatcher>(executor, controller_factory, bus, *default_logger());
 
     auto [controller, services] = CreateDevice(SCHS);
     dynamic_pointer_cast<HostServices>(services)->SetDispatcher(dispatcher);

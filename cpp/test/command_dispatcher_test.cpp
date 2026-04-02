@@ -20,7 +20,7 @@ TEST(CommandDispatcherTest, DispatchCommand)
     ControllerFactory controller_factory;
     MockBus bus;
     CommandExecutor executor(bus, controller_factory, *default_logger());
-    CommandDispatcher dispatcher(executor, controller_factory, *default_logger());
+    CommandDispatcher dispatcher(executor, controller_factory, bus, *default_logger());
     PbResult result;
 
     PbCommand command_invalid;
@@ -222,7 +222,7 @@ TEST(CommandDispatcherTest, SetLogLevel)
     ControllerFactory controller_factory;
     MockBus bus;
     CommandExecutor executor(bus, controller_factory, *default_logger());
-    CommandDispatcher dispatcher(executor, controller_factory, *default_logger());
+    CommandDispatcher dispatcher(executor, controller_factory, bus, *default_logger());
 
     const auto level = default_logger()->level();
 
@@ -247,7 +247,7 @@ TEST(CommandDispatcherTest, SetWithoutTypes)
     ControllerFactory controller_factory;
     MockBus bus;
     CommandExecutor executor(bus, controller_factory, *default_logger());
-    CommandDispatcher dispatcher(executor, controller_factory, *default_logger());
+    CommandDispatcher dispatcher(executor, controller_factory, bus, *default_logger());
 
     EXPECT_TRUE(dispatcher.SetWithoutTypes(""));
     EXPECT_FALSE(dispatcher.SetWithoutTypes("xyz"));

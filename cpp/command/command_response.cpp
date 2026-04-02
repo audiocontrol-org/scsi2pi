@@ -551,4 +551,9 @@ void command_response::GetOperationInfo(PbOperationInfo &operation_info)
     CreateOperation(operation_info, PERSIST_CONFIGURATION, "Save current configuration to /etc/s2p.conf");
 
     CreateOperation(operation_info, OPERATION_INFO, "Get operation meta data");
+
+    CreateOperation(operation_info, MIDI_INIT, "Initialize MIDI-via-SCSI session with target device");
+    CreateOperation(operation_info, MIDI_SEND, "Send SysEx data to target via SCSI");
+    CreateOperation(operation_info, MIDI_POLL, "Poll target for pending MIDI response bytes");
+    CreateOperation(operation_info, MIDI_READ, "Read MIDI response from target via SCSI");
 }

@@ -46,7 +46,7 @@ bool S2p::InitBus(bool in_process, bool log_signals)
 
     executor = make_unique<CommandExecutor>(*bus, controller_factory, *s2p_logger);
 
-    dispatcher = make_shared<CommandDispatcher>(*executor, controller_factory, *s2p_logger);
+    dispatcher = make_shared<CommandDispatcher>(*executor, controller_factory, *bus, *s2p_logger);
 
     return true;
 }

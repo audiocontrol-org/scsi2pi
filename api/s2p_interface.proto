@@ -211,6 +211,12 @@ enum PbOperation {
 
     // Persist configuration in /etc/s2p.conf
     PERSIST_CONFIGURATION = 101;
+
+    // MIDI-over-SCSI operations (initiator mode)
+    MIDI_INIT = 200;        // Initialize MIDI-via-SCSI session with target
+    MIDI_SEND = 201;        // Send SysEx to target via SCSI
+    MIDI_POLL = 202;        // Poll target for pending response bytes
+    MIDI_READ = 203;        // Read response from target
 }
 
 // The operation parameter meta data. The parameter data type is provided by the protobuf API.
@@ -456,6 +462,19 @@ message PbVersionInfo {
     string suffix = 1001;
 }
 
+// MIDI-over-SCSI request (initiator mode)
+message PbMidiRequest {
+    int32 target_id = 1;     // SCSI target ID (e.g., 6 for S3000XL)
+    bytes sysex_data = 2;    // SysEx data to send (for MIDI_SEND)
+    int32 read_length = 3;   // Number of bytes to read (for MIDI_READ)
+}
+
+// MIDI-over-SCSI response (initiator mode)
+message PbMidiResponse {
+    bytes data = 1;           // Response data
+    int32 pending_bytes = 2;  // Pending byte count (from MIDI_POLL)
+}
+
 // Supported commands and their parameters
 message PbCommand {
     PbOperation operation = 1;
@@ -463,6 +482,8 @@ message PbCommand {
     repeated PbDeviceDefinition devices = 2;
     // The named parameters for the operation, e.g. a filename, or a network interface list
     map<string, string> params = 3;
+    // MIDI-over-SCSI request parameters (for MIDI_INIT, MIDI_SEND, MIDI_POLL, MIDI_READ)
+    PbMidiRequest midi_request = 20;
 }
 
 // The result of a command
@@ -501,6 +522,8 @@ message PbResult {
         PbStatisticsInfo statistics_info = 15;
         // The result of a PROPERTIES command
         PbPropertiesInfo properties_info = 100;
+        // The result of a MIDI_INIT, MIDI_SEND, MIDI_POLL, or MIDI_READ command
+        PbMidiResponse midi_response = 101;
     }
 }
 
