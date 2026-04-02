@@ -129,17 +129,29 @@ void MidiProcessor::SendData() const
     }
 
     if (length == 0) {
-        // Vendor 0x0D with zero CDB length is a DATA IN command.
-        // The S3000XL reads exactly 3 bytes from the target.
+        // Vendor 0x0D: DATA IN response.
+        // Read response bytes from /tmp/scmp-response.bin if it exists,
+        // otherwise default to 3 bytes of 0x00.
+        // This allows runtime experimentation without recompiling.
         auto &buf = GetController()->GetBuffer();
-        // 3-byte response to 0x0D poll.
-        // Try Akai identifiers: manufacturer (0x47), device (0x48), channel (0x00)
-        buf[0] = 0x47;  // Akai manufacturer ID
-        buf[1] = 0x00;  // SysEx channel
-        buf[2] = 0x48;  // S3000XL device ID
-        GetController()->SetTransferSize(3, 3);
-        LogDebug("MIDI SEND: responding with 3-byte DATA IN [01 00 00]");
-        DataInPhase(3);
+        int resp_len = 3;
+        memset(buf.data(), 0, resp_len);
+
+        FILE *f = fopen("/tmp/scmp-response.bin", "rb");
+        if (f) {
+            resp_len = static_cast<int>(fread(buf.data(), 1, 256, f));
+            fclose(f);
+            if (resp_len < 1) resp_len = 3;
+        }
+
+        string hex;
+        for (int i = 0; i < resp_len; ++i) {
+            hex += fmt::format("{:02x} ", static_cast<uint8_t>(buf[i]));
+        }
+        LogWarn(fmt::format("MIDI 0x0D response ({} bytes): {}", resp_len, hex));
+
+        GetController()->SetTransferSize(resp_len, resp_len);
+        DataInPhase(resp_len);
         return;
     }
 
