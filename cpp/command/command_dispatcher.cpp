@@ -391,9 +391,14 @@ void CommandDispatcher::ProcessMidiQueue()
     }
     case MIDI_SEND: {
         s2p_logger.info("MIDI_SEND: {} byte(s) to target {}", cmd->sysex_data.size(), cmd->target_id);
-        const auto len = static_cast<uint8_t>(cmd->sysex_data.size());
-        vector<uint8_t> cdb = { 0x0c, 0x00, 0x00, 0x00, len, 0x00 };
-        status = initiator.Execute(cdb, cmd->sysex_data, static_cast<int>(cmd->sysex_data.size()), 3, false);
+        // CDB 0x0C (SEND 6): bytes 2-4 are the 3-byte transfer length (MSB first)
+        const auto len = static_cast<int>(cmd->sysex_data.size());
+        vector<uint8_t> cdb = { 0x0c, 0x00,
+            static_cast<uint8_t>((len >> 16) & 0xff),
+            static_cast<uint8_t>((len >> 8) & 0xff),
+            static_cast<uint8_t>(len & 0xff),
+            0x00 };
+        status = initiator.Execute(cdb, cmd->sysex_data, len, 3, false);
         break;
     }
     case MIDI_POLL: {
@@ -410,8 +415,12 @@ void CommandDispatcher::ProcessMidiQueue()
     case MIDI_READ: {
         const int rlen = cmd->read_length;
         s2p_logger.info("MIDI_READ: {} byte(s) from target {}", rlen, cmd->target_id);
-        const auto len_byte = static_cast<uint8_t>(rlen);
-        vector<uint8_t> cdb = { 0x0e, 0x00, 0x00, 0x00, len_byte, 0x00 };
+        // CDB 0x0E: bytes 2-4 are the 3-byte transfer length (MSB first)
+        vector<uint8_t> cdb = { 0x0e, 0x00,
+            static_cast<uint8_t>((rlen >> 16) & 0xff),
+            static_cast<uint8_t>((rlen >> 8) & 0xff),
+            static_cast<uint8_t>(rlen & 0xff),
+            0x00 };
         vector<uint8_t> buffer(rlen);
         status = initiator.Execute(cdb, buffer, rlen, 3, false);
         if (status == 0) {
