@@ -9,6 +9,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -50,8 +51,38 @@ private:
     bool ShutDown(const CommandContext&) const;
 
     bool ExecuteMidi(const CommandContext&, PbResult&);
+    bool ExecuteScsi(const CommandContext&, PbResult&);
 
 public:
+
+    // SCSI generic command queue for main loop execution
+    struct ScsiCommand {
+        int target_id = 0;
+        int target_lun = 0;
+        vector<uint8_t> cdb;
+        vector<uint8_t> data_out;
+        int expected_data_in = 0;
+        int timeout_seconds = 3;
+
+        // Results
+        bool completed = false;
+        bool success = false;
+        int status = -1;
+        vector<uint8_t> sense_data;
+        vector<uint8_t> data_in;
+        int bytes_transferred = 0;
+
+        mutex mtx;
+        condition_variable cv;
+    };
+
+    // Queue a generic SCSI command and wait for the main loop to execute it
+    shared_ptr<ScsiCommand> QueueScsiCommand(int target_id, int target_lun,
+        const vector<uint8_t> &cdb, const vector<uint8_t> &data_out,
+        int expected_data_in, int timeout);
+
+    // Execute pending SCSI commands (called from main loop when bus is free)
+    void ProcessScsiQueue();
 
     // MIDI command queue for main loop execution
     struct MidiCommand {
@@ -76,6 +107,9 @@ public:
     void ProcessMidiQueue();
 
 private:
+
+    deque<shared_ptr<ScsiCommand>> scsi_queue;
+    mutex scsi_queue_mutex;
 
     vector<shared_ptr<MidiCommand>> midi_queue;
     mutex midi_queue_mutex;

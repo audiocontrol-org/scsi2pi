@@ -217,6 +217,9 @@ enum PbOperation {
     MIDI_SEND = 201;        // Send SysEx to target via SCSI
     MIDI_POLL = 202;        // Poll target for pending response bytes
     MIDI_READ = 203;        // Read response from target
+
+    // Generic SCSI command execution (initiator mode)
+    SCSI_EXEC = 210;
 }
 
 // The operation parameter meta data. The parameter data type is provided by the protobuf API.
@@ -475,6 +478,24 @@ message PbMidiResponse {
     int32 pending_bytes = 2;  // Pending byte count (from MIDI_POLL)
 }
 
+// Generic SCSI command execution request (initiator mode)
+message PbScsiRequest {
+    int32 target_id = 1;        // SCSI target ID (0-7)
+    int32 target_lun = 2;       // LUN (0-31), default 0
+    bytes cdb = 3;              // Command Descriptor Block (6, 10, or 12 bytes)
+    bytes data_out = 4;         // Data to send in DATA OUT phase (for writes)
+    int32 expected_data_in = 5; // Expected bytes for DATA IN phase (for reads)
+    int32 timeout_seconds = 6;  // Command timeout (default 3)
+}
+
+// Generic SCSI command execution response (initiator mode)
+message PbScsiResponse {
+    int32 status = 1;           // SCSI status (0=GOOD, 2=CHECK_CONDITION, etc.)
+    bytes sense_data = 2;       // Sense data if status != GOOD
+    bytes data_in = 3;          // Data received in DATA IN phase
+    int32 bytes_transferred = 4; // Actual bytes transferred
+}
+
 // Supported commands and their parameters
 message PbCommand {
     PbOperation operation = 1;
@@ -484,6 +505,8 @@ message PbCommand {
     map<string, string> params = 3;
     // MIDI-over-SCSI request parameters (for MIDI_INIT, MIDI_SEND, MIDI_POLL, MIDI_READ)
     PbMidiRequest midi_request = 20;
+    // Generic SCSI command execution request (for SCSI_EXEC)
+    PbScsiRequest scsi_request = 21;
 }
 
 // The result of a command
@@ -524,6 +547,8 @@ message PbResult {
         PbPropertiesInfo properties_info = 100;
         // The result of a MIDI_INIT, MIDI_SEND, MIDI_POLL, or MIDI_READ command
         PbMidiResponse midi_response = 101;
+        // The result of a SCSI_EXEC command
+        PbScsiResponse scsi_response = 102;
     }
 }
 

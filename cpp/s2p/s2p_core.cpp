@@ -482,6 +482,9 @@ void S2p::ProcessScsiCommands()
         // Process queued MIDI initiator commands while bus is free
         dispatcher->ProcessMidiQueue();
 
+        // Process queued generic SCSI commands while bus is free
+        dispatcher->ProcessScsiQueue();
+
         if (const uint8_t ids = bus->WaitForSelection(); ids) {
             scoped_lock lock(executor->GetDispatchLock());
 

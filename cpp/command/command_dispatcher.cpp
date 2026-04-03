@@ -157,6 +157,9 @@ bool CommandDispatcher::DispatchCommand(const CommandContext &context, PbResult 
     case MIDI_READ:
         return ExecuteMidi(context, result);
 
+    case SCSI_EXEC:
+        return ExecuteScsi(context, result);
+
     case NO_OPERATION:
         return context.ReturnSuccessStatus();
 
@@ -433,6 +436,143 @@ void CommandDispatcher::ProcessMidiQueue()
     default:
         break;
     }
+
+    // Switch bus back to target mode
+    bus.SetInitiatorMode(false);
+
+    // Resume SEL event monitoring for target mode
+    bus.ResumeSelectionEvent();
+
+    // Signal completion
+    {
+        lock_guard lock(cmd->mtx);
+        cmd->success = (status == 0);
+        cmd->completed = true;
+    }
+    cmd->cv.notify_one();
+}
+
+bool CommandDispatcher::ExecuteScsi(const CommandContext &context, PbResult &result)
+{
+    const PbCommand &command = context.GetCommand();
+    const PbScsiRequest &scsi_request = command.scsi_request();
+    const int target_id = scsi_request.target_id();
+    const int target_lun = scsi_request.target_lun();
+
+    if (target_id < 0 || target_id > 7) {
+        return context.ReturnErrorStatus("Invalid SCSI target ID: " + to_string(target_id));
+    }
+
+    if (target_lun < 0 || target_lun > 31) {
+        return context.ReturnErrorStatus("Invalid SCSI LUN: " + to_string(target_lun));
+    }
+
+    const string &cdb_str = scsi_request.cdb();
+    if (cdb_str.empty()) {
+        return context.ReturnErrorStatus("CDB must not be empty");
+    }
+
+    vector<uint8_t> cdb(cdb_str.begin(), cdb_str.end());
+    vector<uint8_t> data_out(scsi_request.data_out().begin(), scsi_request.data_out().end());
+    const int expected_data_in = scsi_request.expected_data_in();
+    int timeout = scsi_request.timeout_seconds();
+    if (timeout <= 0) {
+        timeout = 3;
+    }
+
+    s2p_logger.info("SCSI_EXEC: CDB {} byte(s) to target {}:{}", cdb.size(), target_id, target_lun);
+
+    auto cmd = QueueScsiCommand(target_id, target_lun, cdb, data_out, expected_data_in, timeout);
+
+    // Wait for the main loop to execute it (timeout + 5 seconds grace)
+    {
+        unique_lock lock(cmd->mtx);
+        if (!cmd->cv.wait_for(lock, chrono::seconds(timeout + 5), [&] { return cmd->completed; })) {
+            return context.ReturnErrorStatus("SCSI command timed out waiting for bus access");
+        }
+    }
+
+    auto *scsi_response = result.mutable_scsi_response();
+    scsi_response->set_status(cmd->status);
+    scsi_response->set_sense_data(cmd->sense_data.data(), cmd->sense_data.size());
+    scsi_response->set_data_in(cmd->data_in.data(), cmd->data_in.size());
+    scsi_response->set_bytes_transferred(cmd->bytes_transferred);
+
+    if (!cmd->success) {
+        result.set_status(false);
+        result.set_msg("SCSI command failed with status " + to_string(cmd->status));
+        return context.WriteResult(result);
+    }
+
+    return context.WriteSuccessResult(result);
+}
+
+shared_ptr<CommandDispatcher::ScsiCommand> CommandDispatcher::QueueScsiCommand(
+    int target_id, int target_lun, const vector<uint8_t> &cdb,
+    const vector<uint8_t> &data_out, int expected_data_in, int timeout)
+{
+    auto cmd = make_shared<ScsiCommand>();
+    cmd->target_id = target_id;
+    cmd->target_lun = target_lun;
+    cmd->cdb = cdb;
+    cmd->data_out = data_out;
+    cmd->expected_data_in = expected_data_in;
+    cmd->timeout_seconds = timeout;
+
+    {
+        lock_guard lock(scsi_queue_mutex);
+        scsi_queue.push_back(cmd);
+    }
+
+    return cmd;
+}
+
+void CommandDispatcher::ProcessScsiQueue()
+{
+    shared_ptr<ScsiCommand> cmd;
+
+    {
+        lock_guard lock(scsi_queue_mutex);
+        if (scsi_queue.empty()) return;
+        cmd = scsi_queue.front();
+        scsi_queue.pop_front();
+    }
+
+    // Suspend SEL event monitoring — the kernel gpioevent handler holds PIN_SEL
+    // as INPUT, which conflicts with asserting SEL during initiator selection
+    bus.SuspendSelectionEvent();
+
+    // Switch bus to initiator mode with settling delay
+    bus.SetInitiatorMode(true);
+    usleep(10000);  // 10ms settle time
+
+    // Execute on the main thread where the bus is free
+    InitiatorExecutor initiator(bus, 7, s2p_logger);
+    initiator.SetTarget(cmd->target_id, cmd->target_lun, false);
+
+    int status = -1;
+
+    if (!cmd->data_out.empty()) {
+        // DATA OUT phase (write to target)
+        status = initiator.Execute(cmd->cdb, cmd->data_out,
+            static_cast<int>(cmd->data_out.size()), cmd->timeout_seconds, false);
+    } else if (cmd->expected_data_in > 0) {
+        // DATA IN phase (read from target)
+        vector<uint8_t> buffer(cmd->expected_data_in);
+        status = initiator.Execute(cmd->cdb, buffer,
+            cmd->expected_data_in, cmd->timeout_seconds, false);
+        if (status == 0) {
+            const int byte_count = initiator.GetByteCount();
+            cmd->data_in.assign(buffer.begin(), buffer.begin() + byte_count);
+            cmd->bytes_transferred = byte_count;
+        }
+    } else {
+        // No data transfer
+        vector<uint8_t> buffer;
+        status = initiator.Execute(cmd->cdb, buffer, 0, cmd->timeout_seconds, false);
+    }
+
+    cmd->status = status;
 
     // Switch bus back to target mode
     bus.SetInitiatorMode(false);
