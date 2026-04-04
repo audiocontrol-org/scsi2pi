@@ -15,6 +15,7 @@
 #include "command_executor.h"
 #include "command_image_support.h"
 #include "command_response.h"
+#include "base/primary_device.h"
 #include "controllers/controller_factory.h"
 #include "initiator/initiator_executor.h"
 #include "protobuf/s2p_interface_util.h"
@@ -538,6 +539,85 @@ void CommandDispatcher::ProcessScsiQueue()
         scsi_queue.pop_front();
     }
 
+    // Check if target is an emulated device
+    auto device = controller_factory.GetDeviceForIdAndLun(cmd->target_id, cmd->target_lun);
+    if (device) {
+        // Route to emulated device instead of physical bus
+        ProcessScsiQueueEmulated(cmd, device);
+    } else {
+        // Physical bus target
+        ProcessScsiQueuePhysical(cmd);
+    }
+
+    // Signal completion
+    {
+        lock_guard lock(cmd->mtx);
+        cmd->completed = true;
+    }
+    cmd->cv.notify_one();
+}
+
+void CommandDispatcher::ProcessScsiQueueEmulated(shared_ptr<ScsiCommand> cmd,
+    shared_ptr<PrimaryDevice> device)
+{
+    if (cmd->cdb.empty()) {
+        cmd->status = -1;
+        cmd->success = false;
+        return;
+    }
+
+    const uint8_t opcode = cmd->cdb[0];
+    s2p_logger.info("SCSI_EXEC emulated: target {}:{} CDB {:02x}", cmd->target_id, cmd->target_lun, opcode);
+
+    switch (opcode) {
+    case 0x00: // TEST UNIT READY
+        cmd->status = 0;
+        cmd->success = true;
+        break;
+
+    case 0x12: { // INQUIRY
+        // Build standard INQUIRY response from device metadata
+        vector<uint8_t> inquiry_data(36, 0);
+        // Byte 0: device type (from PbDeviceType mapping)
+        switch (device->GetType()) {
+            case SCHD: case SAHD: inquiry_data[0] = 0x00; break; // Direct access (disk)
+            case SCCD: inquiry_data[0] = 0x05; break; // CD-ROM
+            case SCMO: inquiry_data[0] = 0x07; break; // Optical
+            case SCTP: inquiry_data[0] = 0x01; break; // Sequential (tape)
+            default: inquiry_data[0] = 0x00; break;
+        }
+        inquiry_data[1] = 0x00; // Not removable
+        inquiry_data[2] = 0x02; // SCSI-2
+        inquiry_data[3] = 0x02; // Response format 2
+        inquiry_data[4] = 31;   // Additional length
+        inquiry_data[5] = 0x00;
+        inquiry_data[6] = 0x00;
+        inquiry_data[7] = 0x00;
+        // Bytes 8-35: vendor(8) + product(16) + revision(4)
+        auto name = device->GetPaddedName();
+        for (int j = 0; j < 28 && j < static_cast<int>(name.size()); j++) {
+            inquiry_data[8 + j] = static_cast<uint8_t>(name[j]);
+        }
+        const int alloc_len = cmd->expected_data_in > 0 ? cmd->expected_data_in : 36;
+        const int copy_len = min(static_cast<int>(inquiry_data.size()), alloc_len);
+        cmd->data_in.assign(inquiry_data.begin(), inquiry_data.begin() + copy_len);
+        cmd->bytes_transferred = copy_len;
+        cmd->status = 0;
+        cmd->success = true;
+        break;
+    }
+
+    default:
+        // For unsupported commands, return CHECK CONDITION
+        s2p_logger.warn("SCSI_EXEC emulated: unsupported CDB {:02x} for target {}", opcode, cmd->target_id);
+        cmd->status = 2; // CHECK CONDITION
+        cmd->success = false;
+        break;
+    }
+}
+
+void CommandDispatcher::ProcessScsiQueuePhysical(shared_ptr<ScsiCommand> cmd)
+{
     // Suspend SEL event monitoring — the kernel gpioevent handler holds PIN_SEL
     // as INPUT, which conflicts with asserting SEL during initiator selection
     bus.SuspendSelectionEvent();
@@ -573,18 +653,11 @@ void CommandDispatcher::ProcessScsiQueue()
     }
 
     cmd->status = status;
+    cmd->success = (status == 0);
 
     // Switch bus back to target mode
     bus.SetInitiatorMode(false);
 
     // Resume SEL event monitoring for target mode
     bus.ResumeSelectionEvent();
-
-    // Signal completion
-    {
-        lock_guard lock(cmd->mtx);
-        cmd->success = (status == 0);
-        cmd->completed = true;
-    }
-    cmd->cv.notify_one();
 }

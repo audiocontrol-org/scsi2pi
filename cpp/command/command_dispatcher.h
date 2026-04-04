@@ -22,6 +22,7 @@ class Bus;
 class CommandContext;
 class CommandExecutor;
 class ControllerFactory;
+class PrimaryDevice;
 
 using namespace spdlog;
 using namespace s2p_interface;
@@ -83,6 +84,8 @@ public:
 
     // Execute pending SCSI commands (called from main loop when bus is free)
     void ProcessScsiQueue();
+    void ProcessScsiQueueEmulated(shared_ptr<ScsiCommand> cmd, shared_ptr<PrimaryDevice> device);
+    void ProcessScsiQueuePhysical(shared_ptr<ScsiCommand> cmd);
 
     // MIDI command queue for main loop execution
     struct MidiCommand {
