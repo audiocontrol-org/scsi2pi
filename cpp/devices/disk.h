@@ -34,6 +34,8 @@ public:
 
     int ReadData(data_in_t) override;
 
+    shared_ptr<Cache> GetCache() const { return cache; }
+
     PbCachingMode GetCachingMode() const
     {
         return caching_mode;

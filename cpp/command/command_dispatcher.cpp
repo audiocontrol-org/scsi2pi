@@ -16,6 +16,9 @@
 #include "command_image_support.h"
 #include "command_response.h"
 #include "base/primary_device.h"
+#include "devices/storage_device.h"
+#include "devices/disk.h"
+#include "devices/cache.h"
 #include "controllers/controller_factory.h"
 #include "initiator/initiator_executor.h"
 #include "protobuf/s2p_interface_util.h"
@@ -604,6 +607,117 @@ void CommandDispatcher::ProcessScsiQueueEmulated(shared_ptr<ScsiCommand> cmd,
         cmd->bytes_transferred = copy_len;
         cmd->status = 0;
         cmd->success = true;
+        break;
+    }
+
+    case 0x25: { // READ CAPACITY(10)
+        auto storage = dynamic_pointer_cast<StorageDevice>(device);
+        if (!storage || !storage->GetBlockCount()) {
+            cmd->status = 2;
+            cmd->success = false;
+            break;
+        }
+        vector<uint8_t> resp(8, 0);
+        uint32_t last_lba = static_cast<uint32_t>(
+            min(storage->GetBlockCount() - 1, (uint64_t)0xFFFFFFFF));
+        uint32_t block_size = storage->GetBlockSize();
+        resp[0] = (last_lba >> 24) & 0xff;
+        resp[1] = (last_lba >> 16) & 0xff;
+        resp[2] = (last_lba >> 8) & 0xff;
+        resp[3] = last_lba & 0xff;
+        resp[4] = (block_size >> 24) & 0xff;
+        resp[5] = (block_size >> 16) & 0xff;
+        resp[6] = (block_size >> 8) & 0xff;
+        resp[7] = block_size & 0xff;
+        cmd->data_in = resp;
+        cmd->bytes_transferred = 8;
+        cmd->status = 0;
+        cmd->success = true;
+        s2p_logger.info("SCSI_EXEC emulated: READ CAPACITY last_lba={} block_size={}", last_lba, block_size);
+        break;
+    }
+
+    case 0x28: case 0x08: { // READ(10), READ(6)
+        auto disk = dynamic_pointer_cast<Disk>(device);
+        if (!disk) { cmd->status = 2; cmd->success = false; break; }
+
+        uint32_t lba;
+        uint32_t count;
+        if (opcode == 0x28) { // READ(10)
+            lba = ((uint32_t)cmd->cdb[2] << 24) | ((uint32_t)cmd->cdb[3] << 16) |
+                  ((uint32_t)cmd->cdb[4] << 8) | cmd->cdb[5];
+            count = ((uint32_t)cmd->cdb[7] << 8) | cmd->cdb[8];
+        } else { // READ(6)
+            lba = ((uint32_t)(cmd->cdb[1] & 0x1f) << 16) |
+                  ((uint32_t)cmd->cdb[2] << 8) | cmd->cdb[3];
+            count = cmd->cdb[4] ? cmd->cdb[4] : 256;
+        }
+
+        uint32_t block_size = disk->GetBlockSize();
+        uint32_t byte_count = count * block_size;
+        vector<uint8_t> buffer(byte_count);
+
+        // DiskCache only supports 1 sector at a time — loop
+        bool read_ok = true;
+        for (uint32_t i = 0; i < count; i++) {
+            span<uint8_t> sec_span(buffer.data() + i * block_size, block_size);
+            if (!disk->GetCache()->ReadSectors(sec_span, lba + i, 1)) {
+                s2p_logger.error("SCSI_EXEC emulated: READ failed at LBA {}", lba + i);
+                read_ok = false;
+                break;
+            }
+        }
+        if (read_ok) {
+            cmd->data_in = buffer;
+            cmd->bytes_transferred = byte_count;
+            cmd->status = 0;
+            cmd->success = true;
+        } else {
+            cmd->status = 2;
+            cmd->success = false;
+        }
+        break;
+    }
+
+    case 0x2A: case 0x0A: { // WRITE(10), WRITE(6)
+        auto disk = dynamic_pointer_cast<Disk>(device);
+        if (!disk) { cmd->status = 2; cmd->success = false; break; }
+
+        uint32_t lba;
+        uint32_t count;
+        if (opcode == 0x2A) { // WRITE(10)
+            lba = ((uint32_t)cmd->cdb[2] << 24) | ((uint32_t)cmd->cdb[3] << 16) |
+                  ((uint32_t)cmd->cdb[4] << 8) | cmd->cdb[5];
+            count = ((uint32_t)cmd->cdb[7] << 8) | cmd->cdb[8];
+        } else { // WRITE(6)
+            lba = ((uint32_t)(cmd->cdb[1] & 0x1f) << 16) |
+                  ((uint32_t)cmd->cdb[2] << 8) | cmd->cdb[3];
+            count = cmd->cdb[4] ? cmd->cdb[4] : 256;
+        }
+
+        if (!cmd->data_out.empty()) {
+            uint32_t block_size = disk->GetBlockSize();
+            // DiskCache only supports 1 sector at a time — loop
+            bool write_ok = true;
+            for (uint32_t i = 0; i < count; i++) {
+                span<const uint8_t> sec_span(cmd->data_out.data() + i * block_size, block_size);
+                if (!disk->GetCache()->WriteSectors(sec_span, lba + i, 1)) {
+                    s2p_logger.error("SCSI_EXEC emulated: WRITE failed at LBA {}", lba + i);
+                    write_ok = false;
+                    break;
+                }
+            }
+            if (write_ok) {
+                cmd->status = 0;
+                cmd->success = true;
+            } else {
+                cmd->status = 2;
+                cmd->success = false;
+            }
+        } else {
+            cmd->status = 2;
+            cmd->success = false;
+        }
         break;
     }
 
