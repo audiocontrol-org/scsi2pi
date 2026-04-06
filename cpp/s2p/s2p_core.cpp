@@ -216,10 +216,21 @@ int S2p::Run(span<char*> args, bool in_process, bool log_signals)
     // Start MIDI streaming server on port + 2 (e.g., 6870 if protobuf is on 6868)
     {
         const int midi_port = port > 0 ? port + 2 : 6870;
-        if (const string &error = midi_streaming_server.Init(midi_port, *dispatcher); !error.empty()) {
+        // Find the MidiProcessor device so the streaming server can use its event queue
+        MidiProcessor *midi_proc = nullptr;
+        for (auto device : controller_factory.GetAllDevices()) {
+            if (device->GetType() == SCMP) {
+                midi_proc = dynamic_cast<MidiProcessor*>(device.get());
+                break;
+            }
+        }
+        if (const string &error = midi_streaming_server.Init(midi_port, *dispatcher, midi_proc); !error.empty()) {
             s2p_logger->warn("MIDI streaming server not available: " + error);
         } else {
             midi_streaming_server.Start();
+            if (midi_proc) {
+                s2p_logger->info("MIDI streaming server: event queue connected to MidiProcessor");
+            }
         }
     }
 #endif

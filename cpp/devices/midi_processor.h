@@ -17,6 +17,9 @@
 
 #pragma once
 
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <vector>
 #include "base/primary_device.h"
 
@@ -61,7 +64,18 @@ public:
     bool HasPendingInitiatorCommands() const { return !initiator_queue.empty(); }
     InitiatorCommand PopInitiatorCommand();
 
+    // Event queue for streaming server — WriteData pushes SysEx messages here
+    // so the streaming server can wait on data instead of polling MIDI_POLL.
+    void WaitForSysEx(vector<uint8_t> &out, int timeout_ms = 10000);
+    bool HasQueuedSysEx() const;
+    void ClearSysExQueue();
+
 private:
+
+    // SysEx event queue — WriteData pushes, streaming server waits
+    deque<vector<uint8_t>> sysex_queue;
+    mutable mutex sysex_queue_mutex;
+    condition_variable sysex_queue_cv;
 
     vector<uint8_t> response_buffer;
     vector<InitiatorCommand> initiator_queue;

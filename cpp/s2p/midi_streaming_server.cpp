@@ -8,6 +8,7 @@
 
 #include "midi_streaming_server.h"
 #include "command/command_dispatcher.h"
+#include "devices/midi_processor.h"
 
 #include <arpa/inet.h>
 #include <endian.h>
@@ -27,9 +28,10 @@ MidiStreamingServer::~MidiStreamingServer()
     Stop();
 }
 
-string MidiStreamingServer::Init(int port, CommandDispatcher &disp)
+string MidiStreamingServer::Init(int port, CommandDispatcher &disp, MidiProcessor *midi_proc)
 {
     dispatcher = &disp;
+    midi_processor = midi_proc;
 
     server_fd = socket(PF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -294,8 +296,15 @@ bool MidiStreamingServer::ReadMessage(int fd, uint8_t &msg_type, vector<uint8_t>
 
 vector<uint8_t> MidiStreamingServer::ReceiveSample(int target_id, int sample_number, int channel)
 {
+    if (!midi_processor) {
+        fprintf(stderr, "[midi-stream] SAMPLE_READ: no MidiProcessor available\n");
+        return {};
+    }
+
+    // Clear any stale data in the event queue
+    midi_processor->ClearSysExQueue();
+
     // Send standard SDS Dump Request: F0 7E cc 03 ss ss F7
-    // (7-bit encoding: ss = sample_number & 0x7F, ss = (sample_number >> 7) & 0x7F)
     vector<uint8_t> dump_request = {
         0xF0, 0x7E, static_cast<uint8_t>(channel), 0x03,
         static_cast<uint8_t>(sample_number & 0x7F),
@@ -315,47 +324,23 @@ vector<uint8_t> MidiStreamingServer::ReceiveSample(int target_id, int sample_num
 
     fprintf(stderr, "[midi-stream] SAMPLE_READ: SDS Dump Request sent for sample %d\n", sample_number);
 
-    // Receive SDS messages with ACK handshake at SCSI bus speed.
-    // Flow: Dump Header → ACK → Data Packet 0 → ACK → Data Packet 1 → ACK → ...
+    // Event-driven receive: wait on MidiProcessor's event queue instead of polling.
+    // The main loop handles target transactions (device writes) in WaitForSelection().
+    // MidiProcessor.WriteData() pushes received SysEx to the queue and signals us.
+    // The auto-ACK in WriteData handles ACKs for SDS packets automatically.
+    //
+    // We do NOT poll with MIDI_POLL — that would block the main loop from
+    // accepting the device's target-mode writes.
+
     vector<uint8_t> all_audio_data;
     int packet_count = 0;
     int bits_per_sample = 16;
-    bool transfer_complete = false;
 
-    for (int pkt = 0; pkt < SDS_MAX_PACKETS && !transfer_complete; pkt++) {
-        // Poll for incoming data — accumulate until we have a complete SysEx (ends with F7)
+    for (int pkt = 0; pkt < SDS_MAX_PACKETS; pkt++) {
         vector<uint8_t> incoming;
-        bool got_data = false;
+        midi_processor->WaitForSysEx(incoming, 10000); // 10 second timeout per message
 
-        for (int attempt = 0; attempt < SDS_ACK_POLL_ATTEMPTS; attempt++) {
-            this_thread::sleep_for(chrono::microseconds(POLL_INTERVAL_US));
-
-            auto poll_cmd = dispatcher->QueueMidiCommand(PbOperation::MIDI_POLL, target_id);
-            {
-                unique_lock<mutex> lock(poll_cmd->mtx);
-                poll_cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return poll_cmd->completed; });
-            }
-            if (!poll_cmd->success) continue;
-
-            if (poll_cmd->pending_bytes > 0) {
-                auto read_cmd = dispatcher->QueueMidiCommand(
-                    PbOperation::MIDI_READ, target_id, {}, poll_cmd->pending_bytes);
-                {
-                    unique_lock<mutex> lock(read_cmd->mtx);
-                    read_cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return read_cmd->completed; });
-                }
-                if (read_cmd->success && !read_cmd->response_data.empty()) {
-                    incoming.insert(incoming.end(),
-                        read_cmd->response_data.begin(), read_cmd->response_data.end());
-                    got_data = true;
-                    if (incoming.back() == 0xF7) break;
-                }
-            } else if (got_data) {
-                break;
-            }
-        }
-
-        if (!got_data) {
+        if (incoming.empty()) {
             if (packet_count > 0) {
                 fprintf(stderr, "[midi-stream] SAMPLE_READ: transfer complete after %d packets\n", packet_count);
             } else {
@@ -366,14 +351,15 @@ vector<uint8_t> MidiStreamingServer::ReceiveSample(int target_id, int sample_num
 
         // Parse the SDS message
         if (incoming.size() < 4 || incoming[0] != 0xF0 || incoming[1] != 0x7E) {
-            fprintf(stderr, "[midi-stream] SAMPLE_READ: non-SDS message len=%zu\n", incoming.size());
+            fprintf(stderr, "[midi-stream] SAMPLE_READ: non-SDS message len=%zu (0x%02x)\n",
+                incoming.size(), incoming.empty() ? 0 : incoming[0]);
             continue;
         }
 
         uint8_t sub_id = incoming[3];
 
         if (sub_id == 0x01) {
-            // Dump Header: F0 7E cc 01 ss ss ee pp pp pp ll ll ll [loops] F7
+            // Dump Header
             bits_per_sample = incoming.size() > 6 ? incoming[6] : 16;
             int period = (incoming.size() > 9) ?
                 (incoming[7] | (incoming[8] << 7) | (incoming[9] << 14)) : 0;
@@ -383,40 +369,22 @@ vector<uint8_t> MidiStreamingServer::ReceiveSample(int target_id, int sample_num
 
             fprintf(stderr, "[midi-stream] SAMPLE_READ: Dump Header — bits=%d rate=%dHz length=%d\n",
                 bits_per_sample, sample_rate, length);
-
-            // ACK the header
-            vector<uint8_t> ack = {0xF0, 0x7E, static_cast<uint8_t>(channel), 0x7F, 0x00, 0xF7};
-            auto ack_cmd = dispatcher->QueueMidiCommand(PbOperation::MIDI_SEND, target_id, ack);
-            {
-                unique_lock<mutex> lock(ack_cmd->mtx);
-                ack_cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return ack_cmd->completed; });
-            }
-            fprintf(stderr, "[midi-stream] SAMPLE_READ: ACK sent for header\n");
+            // ACK is handled automatically by MidiProcessor::WriteData
 
         } else if (sub_id == 0x02) {
             // Data Packet: F0 7E cc 02 pp [120 bytes] checksum F7
             uint8_t packet_num = incoming[4];
             packet_count++;
 
-            // Extract the 120 7-bit encoded audio bytes
+            // Extract 7-bit encoded audio bytes (between header and checksum)
             if (incoming.size() > 7) {
                 size_t data_start = 5;
-                size_t data_end = incoming.size() - 2; // before checksum + F7
+                size_t data_end = incoming.size() - 2;
                 for (size_t i = data_start; i < data_end; i++) {
                     all_audio_data.push_back(incoming[i]);
                 }
             }
-
-            // ACK this packet
-            vector<uint8_t> ack = {
-                0xF0, 0x7E, static_cast<uint8_t>(channel), 0x7F,
-                static_cast<uint8_t>(packet_num & 0x7F), 0xF7
-            };
-            auto ack_cmd = dispatcher->QueueMidiCommand(PbOperation::MIDI_SEND, target_id, ack);
-            {
-                unique_lock<mutex> lock(ack_cmd->mtx);
-                ack_cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return ack_cmd->completed; });
-            }
+            // ACK is handled automatically by MidiProcessor::WriteData
 
             if (packet_count % 10 == 0 || packet_count <= 3) {
                 fprintf(stderr, "[midi-stream] SAMPLE_READ: packet %d (pkt#%d), %zu audio bytes total\n",
@@ -424,7 +392,7 @@ vector<uint8_t> MidiStreamingServer::ReceiveSample(int target_id, int sample_num
             }
         } else {
             fprintf(stderr, "[midi-stream] SAMPLE_READ: unexpected SDS sub_id=0x%02x\n", sub_id);
-            transfer_complete = true;
+            break;
         }
     }
 

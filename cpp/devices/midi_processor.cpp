@@ -170,6 +170,13 @@ int MidiProcessor::WriteData(cdb_t cdb, data_out_t buf, int length)
         SocketWrite(buf);
     }
 
+    // Push to event queue for streaming server
+    {
+        lock_guard<mutex> lock(sysex_queue_mutex);
+        sysex_queue.emplace_back(buf.begin(), buf.begin() + data_len);
+    }
+    sysex_queue_cv.notify_one();
+
     // Auto-generate SDS ACK for closed-loop handshaking
     if (data_len >= 4 && buf[0] == 0xf0 && buf[1] == 0x7e) {
         const uint8_t channel = buf[2];
@@ -310,4 +317,32 @@ vector<PbStatistics> MidiProcessor::GetStatistics() const
     EnrichStatistics(statistics, CATEGORY_INFO, BYTE_READ_COUNT, byte_read_count);
     EnrichStatistics(statistics, CATEGORY_INFO, BYTE_WRITE_COUNT, byte_write_count);
     return statistics;
+}
+
+//---------------------------------------------------------------------------
+// SysEx event queue — for streaming server to wait on incoming data
+//---------------------------------------------------------------------------
+
+void MidiProcessor::WaitForSysEx(vector<uint8_t> &out, int timeout_ms)
+{
+    unique_lock<mutex> lock(sysex_queue_mutex);
+    if (sysex_queue_cv.wait_for(lock, chrono::milliseconds(timeout_ms),
+            [this] { return !sysex_queue.empty(); })) {
+        out = std::move(sysex_queue.front());
+        sysex_queue.pop_front();
+    } else {
+        out.clear();
+    }
+}
+
+bool MidiProcessor::HasQueuedSysEx() const
+{
+    lock_guard<mutex> lock(sysex_queue_mutex);
+    return !sysex_queue.empty();
+}
+
+void MidiProcessor::ClearSysExQueue()
+{
+    lock_guard<mutex> lock(sysex_queue_mutex);
+    sysex_queue.clear();
 }

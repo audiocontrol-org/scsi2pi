@@ -26,6 +26,7 @@
 #include <vector>
 
 class CommandDispatcher;
+class MidiProcessor;
 
 using namespace std;
 
@@ -41,7 +42,7 @@ public:
     ~MidiStreamingServer();
 
     // Initialize the server on the given port. Returns empty string on success.
-    string Init(int port, CommandDispatcher &dispatcher);
+    string Init(int port, CommandDispatcher &dispatcher, MidiProcessor *midi_proc = nullptr);
 
     // Start the server thread.
     void Start();
@@ -79,4 +80,5 @@ private:
     atomic<bool> running{false};
     jthread server_thread;
     CommandDispatcher *dispatcher = nullptr;
+    MidiProcessor *midi_processor = nullptr;
 };
