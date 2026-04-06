@@ -14,6 +14,9 @@
 #include "command/command_executor.h"
 #include "controllers/controller_factory.h"
 #include "s2p_thread.h"
+#ifdef BUILD_SCMP
+#include "midi_streaming_server.h"
+#endif
 
 using namespace filesystem;
 
@@ -58,6 +61,10 @@ private:
     string access_token;
 
     S2pThread service_thread;
+
+#ifdef BUILD_SCMP
+    MidiStreamingServer midi_streaming_server;
+#endif
 
     ControllerFactory controller_factory;
 

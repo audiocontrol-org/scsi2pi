@@ -212,6 +212,18 @@ int S2p::Run(span<char*> args, bool in_process, bool log_signals)
 
     service_thread.Start();
 
+#ifdef BUILD_SCMP
+    // Start MIDI streaming server on port + 2 (e.g., 6870 if protobuf is on 6868)
+    {
+        const int midi_port = port > 0 ? port + 2 : 6870;
+        if (const string &error = midi_streaming_server.Init(midi_port, *dispatcher); !error.empty()) {
+            s2p_logger->warn("MIDI streaming server not available: " + error);
+        } else {
+            midi_streaming_server.Start();
+        }
+    }
+#endif
+
     ProcessScsiCommands();
 
     return EXIT_SUCCESS;
