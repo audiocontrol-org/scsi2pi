@@ -53,19 +53,25 @@ public:
 
 private:
     // Message type constants
-    static constexpr uint8_t MSG_INIT  = 0x01;
-    static constexpr uint8_t MSG_SEND  = 0x02;
-    static constexpr uint8_t MSG_DATA  = 0x03;
-    static constexpr uint8_t MSG_ERROR = 0x04;
+    static constexpr uint8_t MSG_INIT        = 0x01;
+    static constexpr uint8_t MSG_SEND        = 0x02;
+    static constexpr uint8_t MSG_DATA        = 0x03;
+    static constexpr uint8_t MSG_ERROR       = 0x04;
+    static constexpr uint8_t MSG_SAMPLE_READ = 0x05;
 
     // Internal polling parameters
     static constexpr int POLL_INTERVAL_US = 500;     // Microseconds between polls
     static constexpr int POLL_MAX_ATTEMPTS = 6000;   // 500us * 6000 = 3 second timeout
     static constexpr int EMPTY_POLL_THRESHOLD = 2;   // Empty polls after data to confirm done
 
+    // SDS sample receive parameters
+    static constexpr int SDS_ACK_POLL_ATTEMPTS = 20000;  // 500us * 20000 = 10 second timeout per packet
+    static constexpr int SDS_MAX_PACKETS = 10000;        // Safety limit
+
     void Execute();
     void HandleClient(int client_fd);
     vector<uint8_t> SendAndReceive(int target_id, const vector<uint8_t> &sysex);
+    vector<uint8_t> ReceiveSample(int target_id, int sample_number, int channel);
     bool WriteMessage(int fd, uint8_t msg_type, const vector<uint8_t> &payload);
     bool ReadMessage(int fd, uint8_t &msg_type, vector<uint8_t> &payload);
 

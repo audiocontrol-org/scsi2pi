@@ -156,6 +156,33 @@ void MidiStreamingServer::HandleClient(int client_fd)
                 break;
             }
 
+            case MSG_SAMPLE_READ: {
+                if (target_id < 0) {
+                    vector<uint8_t> err = {'n', 'o', 't', ' ', 'i', 'n', 'i', 't'};
+                    WriteMessage(client_fd, MSG_ERROR, err);
+                    break;
+                }
+                if (payload.empty()) {
+                    vector<uint8_t> err = {'m', 'i', 's', 's', 'i', 'n', 'g', ' ', 's', 'a', 'm', 'p', 'l', 'e', '#'};
+                    WriteMessage(client_fd, MSG_ERROR, err);
+                    break;
+                }
+
+                int sample_number = payload[0];
+                int channel = 0; // Default exclusive channel
+
+                auto t0 = chrono::steady_clock::now();
+                auto pcm_data = ReceiveSample(target_id, sample_number, channel);
+                auto elapsed = chrono::duration_cast<chrono::milliseconds>(
+                    chrono::steady_clock::now() - t0).count();
+
+                fprintf(stderr, "[midi-stream] SAMPLE_READ sample=%d -> %zu bytes in %lld ms\n",
+                    sample_number, pcm_data.size(), static_cast<long long>(elapsed));
+
+                WriteMessage(client_fd, MSG_DATA, pcm_data);
+                break;
+            }
+
             default:
                 fprintf(stderr, "[midi-stream] unknown message type: 0x%02x\n", msg_type);
                 break;
@@ -263,6 +290,176 @@ bool MidiStreamingServer::ReadMessage(int fd, uint8_t &msg_type, vector<uint8_t>
     }
 
     return true;
+}
+
+vector<uint8_t> MidiStreamingServer::ReceiveSample(int target_id, int sample_number, int channel)
+{
+    // Step 1: Read sample header to get SLNGTH (sample length)
+    // RSDATA: F0 47 cc 0A 48 ss,ss F7 (nibble-encoded sample number)
+    vector<uint8_t> rsdata = {
+        0xF0, 0x47, static_cast<uint8_t>(channel), 0x0A, 0x48,
+        static_cast<uint8_t>(sample_number & 0x0F),
+        static_cast<uint8_t>((sample_number >> 4) & 0x0F),
+        0xF7
+    };
+
+    auto header_response = SendAndReceive(target_id, rsdata);
+    if (header_response.empty()) {
+        fprintf(stderr, "[midi-stream] SAMPLE_READ: failed to read sample header\n");
+        return {};
+    }
+
+    // Parse SLNGTH from header response (nibble-encoded, 4 bytes at offset ~24-31)
+    // The header is in Akai SysEx format. We need the sample length.
+    // For now, request a large number and let the device send what it has.
+    // The device will stop sending packets when it runs out of data.
+    fprintf(stderr, "[midi-stream] SAMPLE_READ: header received (%zu bytes), requesting sample data\n",
+        header_response.size());
+
+    // Step 2: Send RSPACK with 7-bit encoding
+    // F0 47 cc 0C 48 ss,ss oo,oo,oo,oo nn,nn,nn,nn ii if F7
+    // Request a large count — device will stop at actual sample length
+    uint32_t request_count = 1000000; // Request up to 1M samples
+    vector<uint8_t> rspack = {
+        0xF0, 0x47, static_cast<uint8_t>(channel), 0x0C, 0x48,
+        static_cast<uint8_t>(sample_number & 0x7F),
+        static_cast<uint8_t>((sample_number >> 7) & 0x7F),
+        0x00, 0x00, 0x00, 0x00,  // offset 0
+        static_cast<uint8_t>(request_count & 0x7F),
+        static_cast<uint8_t>((request_count >> 7) & 0x7F),
+        static_cast<uint8_t>((request_count >> 14) & 0x7F),
+        static_cast<uint8_t>((request_count >> 21) & 0x7F),
+        0x01,  // interval 1
+        0x00,  // function 0 (single)
+        0xF7
+    };
+
+    // Send RSPACK
+    auto send_cmd = dispatcher->QueueMidiCommand(PbOperation::MIDI_SEND, target_id, rspack);
+    {
+        unique_lock<mutex> lock(send_cmd->mtx);
+        send_cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return send_cmd->completed; });
+    }
+    if (!send_cmd->success) {
+        fprintf(stderr, "[midi-stream] SAMPLE_READ: RSPACK send failed\n");
+        return {};
+    }
+
+    fprintf(stderr, "[midi-stream] SAMPLE_READ: RSPACK sent, waiting for data packets...\n");
+
+    // Step 3: Receive SDS data packets with ACK handshake
+    // The device will send: optional Dump Header (F0 7E cc 01), then Data Packets (F0 7E cc 02)
+    // We must ACK each one (F0 7E cc 7F pp F7) at SCSI bus speed.
+    vector<uint8_t> all_audio_data;
+    int packet_count = 0;
+    bool transfer_complete = false;
+
+    for (int pkt = 0; pkt < SDS_MAX_PACKETS && !transfer_complete; pkt++) {
+        // Poll for incoming data
+        vector<uint8_t> incoming;
+        bool got_data = false;
+
+        for (int attempt = 0; attempt < SDS_ACK_POLL_ATTEMPTS; attempt++) {
+            this_thread::sleep_for(chrono::microseconds(POLL_INTERVAL_US));
+
+            auto poll_cmd = dispatcher->QueueMidiCommand(PbOperation::MIDI_POLL, target_id);
+            {
+                unique_lock<mutex> lock(poll_cmd->mtx);
+                poll_cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return poll_cmd->completed; });
+            }
+            if (!poll_cmd->success) continue;
+
+            int pending = poll_cmd->pending_bytes;
+            if (pending > 0) {
+                auto read_cmd = dispatcher->QueueMidiCommand(
+                    PbOperation::MIDI_READ, target_id, {}, pending);
+                {
+                    unique_lock<mutex> lock(read_cmd->mtx);
+                    read_cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return read_cmd->completed; });
+                }
+                if (read_cmd->success && !read_cmd->response_data.empty()) {
+                    incoming.insert(incoming.end(),
+                        read_cmd->response_data.begin(), read_cmd->response_data.end());
+                    got_data = true;
+                    // Check if we have a complete SysEx message (ends with F7)
+                    if (!incoming.empty() && incoming.back() == 0xF7) {
+                        break;
+                    }
+                }
+            } else if (got_data) {
+                break; // Had data, no more pending
+            }
+        }
+
+        if (!got_data) {
+            fprintf(stderr, "[midi-stream] SAMPLE_READ: no more data after packet %d\n", packet_count);
+            transfer_complete = true;
+            break;
+        }
+
+        // Parse the incoming SysEx message
+        // Check for SDS messages: F0 7E cc ...
+        if (incoming.size() >= 4 && incoming[0] == 0xF0 && incoming[1] == 0x7E) {
+            uint8_t sub_id = incoming[3];
+
+            if (sub_id == 0x01) {
+                // Dump Header — ACK it and continue
+                fprintf(stderr, "[midi-stream] SAMPLE_READ: received Dump Header\n");
+                vector<uint8_t> ack = {0xF0, 0x7E, static_cast<uint8_t>(channel), 0x7F, 0x00, 0xF7};
+                auto ack_cmd = dispatcher->QueueMidiCommand(PbOperation::MIDI_SEND, target_id, ack);
+                {
+                    unique_lock<mutex> lock(ack_cmd->mtx);
+                    ack_cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return ack_cmd->completed; });
+                }
+            } else if (sub_id == 0x02) {
+                // Data Packet — extract audio data, ACK it
+                uint8_t packet_num = incoming[4];
+                packet_count++;
+
+                // Extract audio bytes (skip F0 7E cc 02 pp, strip checksum + F7)
+                if (incoming.size() > 7) {
+                    // SDS data: 120 bytes of 7-bit encoded audio between header and checksum
+                    size_t data_start = 5;
+                    size_t data_end = incoming.size() - 2; // before checksum and F7
+                    for (size_t i = data_start; i < data_end; i++) {
+                        all_audio_data.push_back(incoming[i]);
+                    }
+                }
+
+                // Send ACK
+                vector<uint8_t> ack = {
+                    0xF0, 0x7E, static_cast<uint8_t>(channel), 0x7F,
+                    static_cast<uint8_t>(packet_num & 0x7F), 0xF7
+                };
+                auto ack_cmd = dispatcher->QueueMidiCommand(PbOperation::MIDI_SEND, target_id, ack);
+                {
+                    unique_lock<mutex> lock(ack_cmd->mtx);
+                    ack_cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return ack_cmd->completed; });
+                }
+
+                if (packet_count % 10 == 0) {
+                    fprintf(stderr, "[midi-stream] SAMPLE_READ: %d packets, %zu audio bytes\n",
+                        packet_count, all_audio_data.size());
+                }
+            } else {
+                fprintf(stderr, "[midi-stream] SAMPLE_READ: unexpected SDS sub_id=0x%02x\n", sub_id);
+                transfer_complete = true;
+            }
+        } else if (incoming.size() >= 4 && incoming[0] == 0xF0 && incoming[1] == 0x47) {
+            // Akai SysEx response (might be the initial SDATA header response to RSPACK)
+            fprintf(stderr, "[midi-stream] SAMPLE_READ: Akai SysEx opcode=0x%02x len=%zu (skipping)\n",
+                incoming[3], incoming.size());
+            // Don't ACK Akai messages — they're metadata, not SDS
+        } else {
+            fprintf(stderr, "[midi-stream] SAMPLE_READ: unknown message len=%zu first=0x%02x\n",
+                incoming.size(), incoming.empty() ? 0 : incoming[0]);
+        }
+    }
+
+    fprintf(stderr, "[midi-stream] SAMPLE_READ: complete. %d packets, %zu audio bytes\n",
+        packet_count, all_audio_data.size());
+
+    return all_audio_data;
 }
 
 #endif // BUILD_SCMP
