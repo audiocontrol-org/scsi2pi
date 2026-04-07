@@ -324,59 +324,97 @@ vector<uint8_t> MidiStreamingServer::ReceiveSample(int target_id, int sample_num
 
     fprintf(stderr, "[midi-stream] SAMPLE_READ: SDS Dump Request sent for sample %d\n", sample_number);
 
-    // Event-driven receive: wait on MidiProcessor's event queue instead of polling.
-    // The main loop handles target transactions (device writes) in WaitForSelection().
-    // MidiProcessor.WriteData() pushes received SysEx to the queue and signals us.
-    // The auto-ACK in WriteData handles ACKs for SDS packets automatically.
-    //
-    // We do NOT poll with MIDI_POLL — that would block the main loop from
-    // accepting the device's target-mode writes.
+    // HYBRID APPROACH:
+    // Step 1: The Dump Header arrives via the initiator MIDI channel (MIDI_POLL/READ).
+    //         We must poll briefly to read it and send an ACK.
+    // Step 2: After ACKing the header, Data Packets arrive via target-mode writes
+    //         to the SCMP at ID 0. We wait on the MidiProcessor event queue for those.
+    //         The auto-ACK in WriteData handles per-packet ACKs.
 
+    // --- Step 1: Poll for Dump Header (initiator channel) ---
+    vector<uint8_t> header_data;
+    for (int attempt = 0; attempt < SDS_ACK_POLL_ATTEMPTS; attempt++) {
+        this_thread::sleep_for(chrono::microseconds(POLL_INTERVAL_US));
+
+        auto poll_cmd = dispatcher->QueueMidiCommand(PbOperation::MIDI_POLL, target_id);
+        {
+            unique_lock<mutex> lock(poll_cmd->mtx);
+            poll_cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return poll_cmd->completed; });
+        }
+        if (!poll_cmd->success) continue;
+
+        if (poll_cmd->pending_bytes > 0) {
+            auto read_cmd = dispatcher->QueueMidiCommand(
+                PbOperation::MIDI_READ, target_id, {}, poll_cmd->pending_bytes);
+            {
+                unique_lock<mutex> lock(read_cmd->mtx);
+                read_cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return read_cmd->completed; });
+            }
+            if (read_cmd->success && !read_cmd->response_data.empty()) {
+                header_data = read_cmd->response_data;
+                break;
+            }
+        }
+    }
+
+    if (header_data.empty()) {
+        fprintf(stderr, "[midi-stream] SAMPLE_READ: no Dump Header received\n");
+        return {};
+    }
+
+    // Parse Dump Header
+    int bits_per_sample = 16;
+    if (header_data.size() >= 4 && header_data[0] == 0xF0 && header_data[1] == 0x7E && header_data[3] == 0x01) {
+        bits_per_sample = header_data.size() > 6 ? header_data[6] : 16;
+        int period = (header_data.size() > 9) ?
+            (header_data[7] | (header_data[8] << 7) | (header_data[9] << 14)) : 0;
+        int length = (header_data.size() > 12) ?
+            (header_data[10] | (header_data[11] << 7) | (header_data[12] << 14)) : 0;
+        int sample_rate = period > 0 ? static_cast<int>(1000000000.0 / period) : 0;
+
+        fprintf(stderr, "[midi-stream] SAMPLE_READ: Dump Header — bits=%d rate=%dHz length=%d\n",
+            bits_per_sample, sample_rate, length);
+    } else {
+        fprintf(stderr, "[midi-stream] SAMPLE_READ: unexpected header response (len=%zu, first=0x%02x)\n",
+            header_data.size(), header_data.empty() ? 0 : header_data[0]);
+        return {};
+    }
+
+    // Send ACK for the Dump Header via initiator channel
+    vector<uint8_t> ack = {0xF0, 0x7E, static_cast<uint8_t>(channel), 0x7F, 0x00, 0xF7};
+    auto ack_cmd = dispatcher->QueueMidiCommand(PbOperation::MIDI_SEND, target_id, ack);
+    {
+        unique_lock<mutex> lock(ack_cmd->mtx);
+        ack_cmd->cv.wait_for(lock, chrono::seconds(5), [&] { return ack_cmd->completed; });
+    }
+    fprintf(stderr, "[midi-stream] SAMPLE_READ: ACK sent for Dump Header\n");
+
+    // --- Step 2: Wait for Data Packets via event queue (target channel) ---
+    // The device will now send Data Packets as target-mode writes to SCMP at ID 0.
+    // MidiProcessor::WriteData receives them, pushes to event queue, and auto-ACKs.
+    // We just wait and collect.
     vector<uint8_t> all_audio_data;
     int packet_count = 0;
-    int bits_per_sample = 16;
 
     for (int pkt = 0; pkt < SDS_MAX_PACKETS; pkt++) {
         vector<uint8_t> incoming;
-        midi_processor->WaitForSysEx(incoming, 10000); // 10 second timeout per message
+        midi_processor->WaitForSysEx(incoming, 10000);
 
         if (incoming.empty()) {
             if (packet_count > 0) {
                 fprintf(stderr, "[midi-stream] SAMPLE_READ: transfer complete after %d packets\n", packet_count);
             } else {
-                fprintf(stderr, "[midi-stream] SAMPLE_READ: no response to Dump Request\n");
+                fprintf(stderr, "[midi-stream] SAMPLE_READ: no Data Packets received after ACK\n");
             }
             break;
         }
 
-        // Parse the SDS message
-        if (incoming.size() < 4 || incoming[0] != 0xF0 || incoming[1] != 0x7E) {
-            fprintf(stderr, "[midi-stream] SAMPLE_READ: non-SDS message len=%zu (0x%02x)\n",
-                incoming.size(), incoming.empty() ? 0 : incoming[0]);
-            continue;
-        }
-
-        uint8_t sub_id = incoming[3];
-
-        if (sub_id == 0x01) {
-            // Dump Header
-            bits_per_sample = incoming.size() > 6 ? incoming[6] : 16;
-            int period = (incoming.size() > 9) ?
-                (incoming[7] | (incoming[8] << 7) | (incoming[9] << 14)) : 0;
-            int length = (incoming.size() > 12) ?
-                (incoming[10] | (incoming[11] << 7) | (incoming[12] << 14)) : 0;
-            int sample_rate = period > 0 ? static_cast<int>(1000000000.0 / period) : 0;
-
-            fprintf(stderr, "[midi-stream] SAMPLE_READ: Dump Header — bits=%d rate=%dHz length=%d\n",
-                bits_per_sample, sample_rate, length);
-            // ACK is handled automatically by MidiProcessor::WriteData
-
-        } else if (sub_id == 0x02) {
-            // Data Packet: F0 7E cc 02 pp [120 bytes] checksum F7
+        // Parse SDS Data Packet
+        if (incoming.size() >= 5 && incoming[0] == 0xF0 && incoming[1] == 0x7E && incoming[3] == 0x02) {
             uint8_t packet_num = incoming[4];
             packet_count++;
 
-            // Extract 7-bit encoded audio bytes (between header and checksum)
+            // Extract 7-bit encoded audio bytes
             if (incoming.size() > 7) {
                 size_t data_start = 5;
                 size_t data_end = incoming.size() - 2;
@@ -391,8 +429,8 @@ vector<uint8_t> MidiStreamingServer::ReceiveSample(int target_id, int sample_num
                     packet_count, packet_num, all_audio_data.size());
             }
         } else {
-            fprintf(stderr, "[midi-stream] SAMPLE_READ: unexpected SDS sub_id=0x%02x\n", sub_id);
-            break;
+            fprintf(stderr, "[midi-stream] SAMPLE_READ: non-data message len=%zu subId=0x%02x\n",
+                incoming.size(), incoming.size() >= 4 ? incoming[3] : 0);
         }
     }
 

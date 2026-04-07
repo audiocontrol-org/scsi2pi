@@ -298,9 +298,23 @@ uint8_t RpiBus::WaitForSelection()
         return 0;
     }
     if (epoll_result == 0) {
-        // Timeout — no selection, return to main loop for command processing
+        // Timeout — check raw bus state to detect missed events
+        Acquire();
+        const bool sel_now = GetSEL();
+        if (sel_now) {
+            fprintf(stderr, "[bus] MISSED SEL! epoll timed out but SEL is asserted. DAT=0x%02x BSY=%d\n",
+                GetDAT(), GetBSY());
+        }
         return 0;
     }
+
+    // SEL was asserted — log raw bus state before reading the event
+    Acquire();
+    const uint8_t raw_dat = GetDAT();
+    const bool raw_sel = GetSEL();
+    const bool raw_bsy = GetBSY();
+    const bool raw_io = GetIO();
+    fprintf(stderr, "[bus] SEL event: DAT=0x%02x SEL=%d BSY=%d IO=%d\n", raw_dat, raw_sel, raw_bsy, raw_io);
 
     if (gpioevent_data gpev; read(selevreq.fd, &gpev, sizeof(gpev)) == -1) {
         if (errno != EINTR) {
@@ -309,7 +323,9 @@ uint8_t RpiBus::WaitForSelection()
         return 0;
     }
 
-    return GetSelection();
+    const uint8_t selection = GetSelection();
+    fprintf(stderr, "[bus] GetSelection: 0x%02x\n", selection);
+    return selection;
 #else
     return 0;
 #endif
