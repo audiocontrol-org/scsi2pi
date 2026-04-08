@@ -19,7 +19,7 @@ Refactor the audiocontrol-org/scsi2pi fork to separate general-purpose SCSI init
 ### Target State
 
 - **Upstream PR**: ~250 lines of general-purpose initiator mode + SCSI_EXEC
-- **External scsi-midi-server**: All MIDI protocol logic, binary streaming server
+- **scsi-midi-bridge**: Migrated to use only SCSI_EXEC (no MIDI_* ops, no streaming client)
 - **Fork simplified**: Rebased on upstream with SCSI_EXEC, no MIDI code in s2p
 
 ---
@@ -133,82 +133,111 @@ Add unit tests for SCSI_EXEC functionality.
 
 ---
 
-## Phase 2: External scsi-midi-server
+## Phase 2: Migrate scsi-midi-bridge to SCSI_EXEC-Only
 
-**Goal:** Create a standalone service that implements all MIDI-over-SCSI protocol logic, communicating with s2p via SCSI_EXEC.
+**Goal:** Remove all MIDI_* protobuf operations and MidiStreamingServer (port 6870) dependency from the existing Rust scsi-midi-bridge. The bridge already has SCSI_EXEC-based equivalents for all MIDI operations (`scsi_midi_send/poll/read` in `s2p_client.rs`), and `scsi_midi.rs` (SDS transfers) already uses them exclusively. This phase is mostly deletion.
 
-### Task 2.1: S2pClient — protobuf client
+### Current Bridge Architecture
 
-Implement a client that connects to s2p's protobuf socket and sends SCSI_EXEC commands.
+The bridge (`services/scsi-midi-bridge/`) has two transport paths to s2p:
 
-**Files:**
-- Create: `src/scsi/S2pClient.ts`
-- Create: `src/scsi/ScsiExecutor.ts`
+| Path | Operations | Port | Used by |
+|------|-----------|------|---------|
+| Protobuf MIDI_* | MIDI_INIT, MIDI_SEND, MIDI_POLL, MIDI_READ | 6868 | `send_sysex`, `poll`, `read`, `send_and_receive` |
+| Streaming client | Binary TCP protocol (MSG_INIT, MSG_SEND, MSG_DATA) | 6870 | `send_and_receive` (primary path) |
+| SCSI_EXEC | Generic CDB execution | 6868 | `scsi_midi_*` methods, disk ops, INQUIRY, READ CAPACITY |
 
-**Acceptance Criteria:**
-- [ ] Connects to s2p protobuf socket (default port 6868)
-- [ ] Sends PbCommand with SCSI_EXEC operation
-- [ ] Receives PbResult with ScsiResponse
-- [ ] Connection error handling and reconnection
+After refactor, only SCSI_EXEC remains.
 
-### Task 2.2: AkaiProtocol — MIDI-via-SCSI commands
+### Task 2.1: Remove MIDI_* operations from s2p_client.rs
 
-Port the Akai MIDI-over-SCSI protocol from MidiStreamingServer.cpp.
+Delete the MIDI-specific protobuf message builders and operations. Rewrite `send_and_receive` to use the existing `scsi_midi_send/poll/read` methods (which already use SCSI_EXEC).
 
 **Files:**
-- Create: `src/midi/AkaiProtocol.ts`
+- Modify: `services/scsi-midi-bridge/src/s2p_client.rs`
+
+**Remove:**
+- Constants: `MIDI_INIT`, `MIDI_SEND`, `MIDI_POLL`, `MIDI_READ` (~4 lines)
+- Functions: `build_midi_request`, `build_command`, `build_midi_init`, `build_midi_send`, `build_midi_poll`, `build_midi_read` (~45 lines)
+- Methods: `ensure_init()`, `send_sysex()`, `poll()`, `read()` (~60 lines)
+- Rewrite: `send_and_receive()` to use `scsi_midi_enable` + `scsi_midi_send` + `scsi_midi_poll` + `scsi_midi_read`
+
+**Keep unchanged:**
+- `execute_scsi()` and all `build_scsi_*` functions
+- `scsi_midi_enable/disable/send/poll/read` methods (already use SCSI_EXEC)
+- `send_command()` TCP client (still needed for SCSI_EXEC)
 
 **Acceptance Criteria:**
-- [ ] initSession() — CDB 0x09
-- [ ] sendSysEx(data) — CDB 0x0C with 3-byte length encoding
-- [ ] poll() — CDB 0x0D, returns pending byte count
-- [ ] readData(length) — CDB 0x0E with 3-byte length encoding
-- [ ] sendAndReceive() — high-level send + poll + read loop
+- [ ] No MIDI_* constants or message builders remain
+- [ ] `send_and_receive` uses `scsi_midi_*` methods via SCSI_EXEC
+- [ ] All HTTP endpoints still work (SysEx send/receive, SDS transfer, disk ops)
 
-### Task 2.3: SDS transfer support
+### Task 2.2: Remove MidiStreamClient from s2p_client.rs
 
-Port SDS sample transfer logic from ReceiveSample in MidiStreamingServer.cpp.
+Delete the entire streaming client (binary TCP protocol to port 6870).
 
 **Files:**
-- Create: `src/midi/SdsTransfer.ts`
+- Modify: `services/scsi-midi-bridge/src/s2p_client.rs`
+
+**Remove:**
+- Constants: `MSG_INIT`, `MSG_SEND`, `MSG_DATA`, `MSG_ERROR` (~4 lines)
+- Functions: `write_frame`, `read_frame` (~25 lines)
+- Struct: `MidiStreamClient` and all its methods (~170 lines)
 
 **Acceptance Criteria:**
-- [ ] SDS Dump Request generation
-- [ ] SDS header parsing (bits-per-sample, sample rate, length)
-- [ ] Data packet collection via polling
-- [ ] ACK generation for each packet
-- [ ] 7-bit decoding of audio data
+- [ ] No `MidiStreamClient` struct or binary protocol code remains
+- [ ] ~200 lines removed
 
-### Task 2.4: Binary streaming server
+### Task 2.3: Remove streaming client from main.rs and routes.rs
 
-Port the TCP streaming server with binary length-delimited protocol.
+Remove MidiStreamClient from application state and route handlers.
 
 **Files:**
-- Create: `src/server/MidiStreamingServer.ts`
-- Create: `src/server/BinaryProtocol.ts`
+- Modify: `services/scsi-midi-bridge/src/main.rs`
+- Modify: `services/scsi-midi-bridge/src/routes.rs`
+- Modify: `services/scsi-midi-bridge/src/config.rs` (if `midi_port` config exists)
+
+**Changes in main.rs:**
+- Remove `MidiStreamClient::new()` instantiation
+- Remove `midi_stream` from `AppState`
+- Remove `config.midi_port` usage
+
+**Changes in routes.rs:**
+- Remove `midi_stream` from `AppState` struct
+- `sds_send`: Remove streaming client as primary path; use `send_and_receive` directly (now SCSI_EXEC-based)
+- `sds_poll`: Rewrite to use `scsi_midi_poll/read` instead of `poll/read` (MIDI_* based)
+- `handle_ws_send`: Remove streaming client fallback; use `send_and_receive` directly
 
 **Acceptance Criteria:**
-- [ ] TCP server on configurable port (default 6870)
-- [ ] Binary message protocol: [4-byte LE length][1-byte type][payload]
-- [ ] MSG_INIT, MSG_SEND, MSG_DATA, MSG_ERROR, MSG_SAMPLE_READ
-- [ ] Client session management
-- [ ] Compatible with existing audiocontrol MIDI client
+- [ ] No `MidiStreamClient` references in any file
+- [ ] No `midi_port` configuration
+- [ ] All routes use SCSI_EXEC path exclusively
+- [ ] Bridge connects to s2p on port 6868 only
 
-### Task 2.5: Integration and CLI
+### Task 2.4: Update scsi_midi.rs send_and_receive calls
 
-Wire components together with CLI entry point.
+Verify `scsi_midi.rs` needs no changes. It already calls `scsi_midi_send/poll/read` on `S2pClient`, which use SCSI_EXEC. Confirm the `S2pClient` method signatures haven't changed in a way that breaks it.
 
 **Files:**
-- Create: `src/main.ts`
-- Create: `src/config/Config.ts`
+- Review: `services/scsi-midi-bridge/src/scsi_midi.rs` (expect no changes)
 
 **Acceptance Criteria:**
-- [ ] CLI with --s2p-host, --s2p-port, --listen-port options
-- [ ] Connects to s2p on startup
-- [ ] Starts streaming server
-- [ ] Graceful shutdown
+- [ ] `scsi_midi.rs` compiles without changes
+- [ ] SDS download and upload still work via SCSI_EXEC
 
-**Phase 2 Verification:** Service starts, connects to s2p, handles MIDI client connections.
+### Task 2.5: Build and test
+
+Build the bridge and verify all endpoints work.
+
+**Acceptance Criteria:**
+- [ ] `cargo build` succeeds
+- [ ] `cargo test` passes (existing unit tests in scsi_midi.rs)
+- [ ] `/health`, `/status` endpoints respond
+- [ ] `/sds/send` sends SysEx via SCSI_EXEC
+- [ ] `/sds/stream` WebSocket handles sample-download/upload via SCSI_EXEC
+- [ ] `/scsi/exec`, `/scsi/inquiry`, `/scsi/read`, `/scsi/write` unchanged
+
+**Phase 2 Verification:** Bridge builds, tests pass, no connection to port 6870.
 
 ---
 
@@ -283,10 +312,9 @@ Phase 1 (upstream PR branch)
   1.2, 1.4 -> 1.6 (timeout)
   1.5 -> 1.7 (tests)
 
-Phase 2 (scsi-midi-server) — independent of Phase 1
-  2.1 (S2pClient) -> 2.2 (AkaiProtocol) -> 2.3 (SDS)
-  2.1 -> 2.4 (streaming server)
-  2.2, 2.3, 2.4 -> 2.5 (integration)
+Phase 2 (bridge migration) — independent of Phase 1
+  2.1 (remove MIDI_*) -> 2.2 (remove MidiStreamClient) -> 2.3 (routes cleanup)
+  2.3 -> 2.4 (verify scsi_midi.rs) -> 2.5 (build + test)
 
 Phase 3 (fork cleanup) — after Phase 1 upstream PR is merged
   3.1 -> 3.2 -> 3.3
@@ -302,13 +330,15 @@ Phase 4 (submit) — after Phase 1 is complete
 | Risk | Mitigation |
 |------|------------|
 | Upstream maintainer rejects initiator mode | Design is general-purpose; emphasize value for SCSI debugging, bridge use cases |
-| 10ms polling latency too slow for SDS | Measure actual latency; fall back to native addon for tight polling if needed |
 | Constructor signature break | Use optional Bus* parameter with nullptr default |
 | WaitForSelection timeout affects stability | Make timeout configurable; default to infinite when no SCSI queue activity |
+| Bridge latency regression after removing streaming client | `scsi_midi_*` methods already work at same speed; streaming client was a fallback optimization, not a requirement |
 
 ---
 
 ## Critical Files
+
+### scsi2pi (upstream PR)
 
 | File | Role |
 |------|------|
@@ -317,3 +347,12 @@ Phase 4 (submit) — after Phase 1 is complete
 | `cpp/command/command_dispatcher.cpp` | SCSI_EXEC queue and execution |
 | `api/s2p_interface.proto` | Protobuf API for SCSI_EXEC |
 | `cpp/s2p/s2p_core.cpp` | Main loop integration |
+
+### scsi-midi-bridge (Phase 2 migration)
+
+| File | Role |
+|------|------|
+| `services/scsi-midi-bridge/src/s2p_client.rs` | Remove MIDI_* ops and MidiStreamClient; keep SCSI_EXEC |
+| `services/scsi-midi-bridge/src/routes.rs` | Remove streaming client fallback from handlers |
+| `services/scsi-midi-bridge/src/main.rs` | Remove MidiStreamClient from app state |
+| `services/scsi-midi-bridge/src/scsi_midi.rs` | No changes expected — already uses SCSI_EXEC |
